@@ -1,0 +1,9 @@
+models
+imported_code
+.env
+__pycache__/
+*.pyc
+.venv/
+*.gguf
+*.onnx
+*.mp3

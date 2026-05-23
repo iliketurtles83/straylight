@@ -1,0 +1,6 @@
+# Core pipeline framework - local audio, silero VAD, whisper STT, openai-compat LLM, piper TTS
+pipecat-ai[local,silero,whisper,openai,piper]
+# openwakeword 0.6.0 pulls tflite-runtime wheels unavailable on Python 3.12.
+# 0.4.0 is the latest known-good release for this environment.
+openwakeword==0.4.0
+httpx
