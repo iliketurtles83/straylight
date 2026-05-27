@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from services.voice.core import ConversationWindow, TranscriptTurn, audio_to_wav_bytes, load_system_prompt, normalize_reply_text, trim_to_last_turns
 from services.voice.clients import VoiceDependencyError
@@ -57,10 +58,31 @@ class VoiceCoreTests(unittest.TestCase):
 
         self.assertEqual([turn.content for turn in trimmed], ["c", "d", "e", "f"])
 
+    def test_voice_config_reads_preferred_audio_device_names(self) -> None:
+        from unittest.mock import patch
+
+        env = {
+            "CASS_INPUT_DEVICE_NAME": "Wireless Stereo Headset",
+            "CASS_OUTPUT_DEVICE_NAME": "USB Audio",
+        }
+
+        with patch.dict(os.environ, env, clear=False):
+            from services.voice.core import VoiceConfig
+
+            config = VoiceConfig.from_env()
+
+        self.assertEqual(config.input_device_name, "Wireless Stereo Headset")
+        self.assertEqual(config.output_device_name, "USB Audio")
+
 
 class WakeWordProcessorTests(unittest.TestCase):
     def _make_processor(self, triggered_result: tuple[float, bool] = (0.0, False)):
-        """Build a WakeWordProcessor with a mocked detector and SileroVAD."""
+        """Build a WakeWordProcessor with a mocked detector.
+
+        vad_threshold=0.0 disables the RMS energy gate so test audio content
+        doesn't need to simulate real speech levels — tests focus on wake
+        detection logic, not the energy gate itself.
+        """
         from services.voice.wake import WakeWordProcessor
 
         detector = MagicMock()
@@ -69,13 +91,7 @@ class WakeWordProcessorTests(unittest.TestCase):
 
         ack_path = Path(tempfile.mktemp(suffix=".mp3"))
 
-        # Patch SileroVADAnalyzer so it doesn't load the ONNX model on init.
-        with patch("services.voice.wake.SileroVADAnalyzer") as MockVAD:
-            vad_instance = MagicMock()
-            vad_instance.voice_confidence.return_value = 1.0  # Always "loud" so OWW is called.
-            MockVAD.return_value = vad_instance
-            proc = WakeWordProcessor(detector=detector, ack_path=ack_path)
-
+        proc = WakeWordProcessor(detector=detector, ack_path=ack_path, vad_threshold=0.0)
         return proc, detector
 
     def test_wake_word_processor_sleeping_drops_frames(self) -> None:
@@ -108,6 +124,30 @@ class WakeWordProcessorTests(unittest.TestCase):
         from services.voice.wake import WakeWordFrame
         self.assertFalse(any(isinstance(f, WakeWordFrame) for f in received))
         self.assertFalse(any(isinstance(f, InputAudioRawFrame) for f in received))
+
+    def test_wake_word_processor_sleeping_drops_upstream_input(self) -> None:
+        """Input audio should be gated while sleeping regardless of direction."""
+        from pipecat.frames.frames import InputAudioRawFrame
+        from pipecat.processors.frame_processor import FrameDirection
+
+        proc, _detector = self._make_processor(triggered_result=(0.0, False))
+        received: list = []
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                received.append((frame, direction))
+
+            proc.push_frame = capture  # type: ignore[method-assign]
+
+            frame = InputAudioRawFrame(
+                audio=b"\x00" * 3072,
+                sample_rate=16000,
+                num_channels=1,
+            )
+            await proc.process_frame(frame, FrameDirection.UPSTREAM)
+
+        asyncio.run(run())
+        self.assertEqual(received, [])
 
     def test_wake_word_processor_emits_wake_frame_on_trigger(self) -> None:
         """A triggered OWW detection should emit WakeWordFrame and switch to awake."""
@@ -159,6 +199,202 @@ class WakeWordProcessorTests(unittest.TestCase):
 
             with self.assertRaises(VoiceDependencyError):
                 asyncio.run(validate_startup(config))
+
+    def test_to_mono_pcm16_uses_first_channel(self) -> None:
+        from pipecat.frames.frames import InputAudioRawFrame
+        from services.voice.wake import WakeWordProcessor
+
+        # Interleaved stereo: L=[1000, 2000], R=[-1000, -2000].
+        frame = InputAudioRawFrame(
+            audio=(b"\xe8\x03\x18\xfc\xd0\x07\x30\xf8"),
+            sample_rate=16000,
+            num_channels=2,
+        )
+
+        mono = WakeWordProcessor._to_mono_pcm16(frame)
+        self.assertEqual(mono.tolist(), [1000, 2000])
+
+    def test_resample_to_16k_from_48k(self) -> None:
+        from services.voice.wake import WakeWordProcessor
+
+        # 48k input should downsample by ~3x when normalized to 16k.
+        src = list(range(480))
+        import numpy as np
+
+        out = WakeWordProcessor._resample_to_16k(np.asarray(src, dtype=np.int16), 48000)
+        self.assertTrue(158 <= len(out) <= 162)
+
+    def test_post_wake_flush_clamp_prevents_negative(self) -> None:
+        """_flush_remaining must not go negative when a frame is larger than the flush window."""
+        from pipecat.frames.frames import InputAudioRawFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        from services.voice.wake import _State, WakeWordProcessor
+
+        proc, _detector = self._make_processor(triggered_result=(0.85, True))
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                pass
+
+            proc.push_frame = capture  # type: ignore[method-assign]
+
+            async def no_ack() -> None:
+                pass
+
+            proc._play_ack = no_ack  # type: ignore[method-assign]
+            proc._awake_timeout = no_ack  # suppress timeout task
+
+            # First frame: triggers wake; sets _flush_remaining = OWW_CHUNK_BYTES (2560 bytes).
+            trigger_frame = InputAudioRawFrame(
+                audio=b"\x00" * 3072, sample_rate=16000, num_channels=1
+            )
+            await proc.process_frame(trigger_frame, FrameDirection.DOWNSTREAM)
+            self.assertEqual(proc._state, _State.awake)
+
+            # Second frame: much larger than remaining flush window.
+            big_frame = InputAudioRawFrame(
+                audio=b"\x00" * 10000, sample_rate=16000, num_channels=1
+            )
+            await proc.process_frame(big_frame, FrameDirection.DOWNSTREAM)
+
+        asyncio.run(run())
+        self.assertGreaterEqual(proc._flush_remaining, 0, "_flush_remaining must not go negative")
+
+    def test_stuck_awake_timeout_resets_to_sleeping(self) -> None:
+        """WakeWordProcessor must reset to sleeping if BotStoppedSpeakingFrame never arrives."""
+        from pathlib import Path
+        import tempfile
+        from pipecat.frames.frames import InputAudioRawFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        from services.voice.wake import _State, WakeWordProcessor
+        from unittest.mock import MagicMock
+
+        detector = MagicMock()
+        detector.triggered.return_value = (0.85, True)
+        detector.reset.return_value = None
+
+        ack_path = Path(tempfile.mktemp(suffix=".mp3"))
+        proc = WakeWordProcessor(
+            detector=detector,
+            ack_path=ack_path,
+            vad_threshold=0.0,
+            awake_timeout_seconds=0.05,  # very short for test speed
+        )
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                pass
+
+            proc.push_frame = capture  # type: ignore[method-assign]
+
+            async def no_ack() -> None:
+                pass
+
+            proc._play_ack = no_ack  # type: ignore[method-assign]
+
+            frame = InputAudioRawFrame(
+                audio=b"\x00" * 3072, sample_rate=16000, num_channels=1
+            )
+            await proc.process_frame(frame, FrameDirection.DOWNSTREAM)
+            self.assertEqual(proc._state, _State.awake)
+
+            # Wait longer than the timeout — no BotStoppedSpeakingFrame sent.
+            await asyncio.sleep(0.15)
+
+        asyncio.run(run())
+        self.assertEqual(
+            proc._state, _State.sleeping,
+            "processor must reset to sleeping after awake timeout with no BotStoppedSpeakingFrame",
+        )
+
+
+class ContextTrimmerTests(unittest.TestCase):
+    def test_wake_reset_relay_pushes_bot_stop_upstream_on_tts_stop(self) -> None:
+        """WakeResetRelay should mirror TTSStoppedFrame upstream as BotStoppedSpeakingFrame."""
+        from pipecat.frames.frames import BotStoppedSpeakingFrame, TTSStoppedFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        from services.voice.main import WakeResetRelay
+
+        relay = WakeResetRelay()
+        seen: list[tuple[object, FrameDirection]] = []
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                seen.append((frame, direction))
+
+            relay.push_frame = capture  # type: ignore[method-assign]
+            await relay.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+
+        asyncio.run(run())
+
+        self.assertEqual(len(seen), 2)
+        self.assertIsInstance(seen[0][0], BotStoppedSpeakingFrame)
+        self.assertEqual(seen[0][1], FrameDirection.UPSTREAM)
+        self.assertIsInstance(seen[1][0], TTSStoppedFrame)
+        self.assertEqual(seen[1][1], FrameDirection.DOWNSTREAM)
+
+    def test_context_trimmer_caps_non_system_messages(self) -> None:
+        """ContextTrimmer trims oldest turns, preserving the system message."""
+        from pipecat.frames.frames import BotStoppedSpeakingFrame
+        from pipecat.processors.aggregators.llm_context import LLMContext
+        from pipecat.processors.frame_processor import FrameDirection
+        from services.voice.main import ContextTrimmer
+
+        context = LLMContext(messages=[
+            {"role": "system", "content": "you are cass"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "user", "content": "u3"},
+            {"role": "assistant", "content": "a3"},
+            {"role": "user", "content": "u4"},
+            {"role": "assistant", "content": "a4"},
+        ])
+        trimmer = ContextTrimmer(context=context, history_turns=2)
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                pass
+
+            trimmer.push_frame = capture  # type: ignore[method-assign]
+            await trimmer.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+        asyncio.run(run())
+
+        non_system = [m for m in context.messages if m.get("role") != "system"]
+        # history_turns=2 → keep last 4 messages (2 user + 2 assistant)
+        self.assertEqual(len(non_system), 4)
+        self.assertEqual(non_system[0]["content"], "u3")
+        self.assertEqual(non_system[-1]["content"], "a4")
+        # System message must survive trimming
+        self.assertEqual(context.messages[0]["role"], "system")
+        self.assertEqual(context.messages[0]["content"], "you are cass")
+
+    def test_context_trimmer_leaves_short_history_untouched(self) -> None:
+        """ContextTrimmer must not modify context already within the turn limit."""
+        from pipecat.frames.frames import BotStoppedSpeakingFrame
+        from pipecat.processors.aggregators.llm_context import LLMContext
+        from pipecat.processors.frame_processor import FrameDirection
+        from services.voice.main import ContextTrimmer
+
+        context = LLMContext(messages=[
+            {"role": "system", "content": "you are cass"},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ])
+        original_len = len(context.messages)
+        trimmer = ContextTrimmer(context=context, history_turns=6)
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                pass
+
+            trimmer.push_frame = capture  # type: ignore[method-assign]
+            await trimmer.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+
+        asyncio.run(run())
+        self.assertEqual(len(context.messages), original_len)
 
 
 if __name__ == "__main__":

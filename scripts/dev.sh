@@ -2,7 +2,10 @@
 # Straylight Phase 1 dev launcher.
 #
 # Usage:
-#   bash scripts/dev.sh          (reads .env)
+#   bash scripts/dev.sh                  (reads .env, wake word mode)
+#   bash scripts/dev.sh --listen         (skip wake word, always-on STT)
+#   bash scripts/dev.sh --no-validate    (skip startup asset checks)
+#   bash scripts/dev.sh --listen --no-validate
 #   LLAMA_MODEL=... bash scripts/dev.sh
 #
 # Starts llama-server with performance-tuned flags, waits for /health,
@@ -21,6 +24,28 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
   source "${REPO_ROOT}/.env"
   set +o allexport
 fi
+
+# --------------------------------------------------------------------------
+# Argument parsing — flags forwarded verbatim to voice.main
+# --------------------------------------------------------------------------
+VOICE_ARGS=()
+for arg in "$@"; do
+  case "${arg}" in
+    --listen)        VOICE_ARGS+=("--listen") ;;
+    --no-validate)   VOICE_ARGS+=("--no-validate") ;;
+    --help|-h)
+      echo "Usage: $0 [--listen] [--no-validate]"
+      echo "  --listen       Skip wake word; STT always active"
+      echo "  --no-validate  Skip startup asset/service checks"
+      exit 0
+      ;;
+    *)
+      echo "ERROR: unknown argument: ${arg}" >&2
+      echo "Run '$0 --help' for usage." >&2
+      exit 1
+      ;;
+  esac
+done
 
 # --------------------------------------------------------------------------
 # Configuration — all overridable via .env
@@ -158,9 +183,9 @@ echo "[dev.sh] llama-server healthy after ${elapsed}s"
 # --------------------------------------------------------------------------
 # Start the voice service
 # --------------------------------------------------------------------------
-echo "[dev.sh] starting voice service"
+echo "[dev.sh] starting voice service (args: ${VOICE_ARGS[*]:-none})"
 cd "${REPO_ROOT}/services"
-"${VENV}" -m voice.main &
+"${VENV}" -m voice.main "${VOICE_ARGS[@]}" &
 VOICE_PID=$!
 
 set +e

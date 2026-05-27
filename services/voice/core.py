@@ -35,6 +35,8 @@ class VoiceConfig:
     llm_model: str = "cass"
     tts_model_path: Path = _BASE_DIR / "models" / "tts" / "en_US-amy-medium.onnx"
     ack_sound_path: Path = _BASE_DIR / "models" / "tts" / "ack.mp3"
+    input_device_name: str | None = None
+    output_device_name: str | None = None
     history_turns: int = 6
     listen_mode: bool = False  # skip wake word; pipeline always active
 
@@ -64,6 +66,8 @@ class VoiceConfig:
             llm_model=os.getenv("CASS_LLM_MODEL", "cass").strip() or "cass",
             tts_model_path=tts_model_path,
             ack_sound_path=ack_sound_path,
+            input_device_name=_env_optional_str("CASS_INPUT_DEVICE_NAME"),
+            output_device_name=_env_optional_str("CASS_OUTPUT_DEVICE_NAME"),
             history_turns=_env_int("CASS_HISTORY_TURNS", 6),
             listen_mode=os.getenv("CASS_LISTEN_MODE", "").strip().lower() in ("1", "true", "yes"),
         )
@@ -111,6 +115,11 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError as exc:
         raise ValueError(f"Invalid float for {name}: {raw}") from exc
+
+
+def _env_optional_str(name: str) -> str | None:
+    raw = os.getenv(name, "").strip()
+    return raw or None
 
 
 def load_system_prompt(prompt_path: Path) -> str:
