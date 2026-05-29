@@ -7,8 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from services.voice.core import ConversationWindow, TranscriptTurn, audio_to_wav_bytes, load_system_prompt, normalize_reply_text, trim_to_last_turns
+from services.voice.agent import AgentProcessor
+from services.voice.core import ConversationWindow, TranscriptTurn, VoiceConfig, audio_to_wav_bytes, load_system_prompt, normalize_reply_text, trim_to_last_turns
 from services.voice.clients import VoiceDependencyError
+from services.voice.skills import Skill
+from services.voice.skills.weather import WeatherSkill
 
 
 class VoiceCoreTests(unittest.TestCase):
@@ -397,6 +400,61 @@ class ContextTrimmerTests(unittest.TestCase):
         self.assertEqual(len(context.messages), original_len)
 
 
+class WeatherSkillTests(unittest.TestCase):
+    def test_weather_skill_extracts_location_with_preposition(self) -> None:
+        skill = WeatherSkill()
+        entities = skill.entities("what's the weather in London tomorrow?")
+        self.assertEqual(entities["location"], "London")
+
+    def test_weather_skill_can_handle_weather_queries(self) -> None:
+        skill = WeatherSkill()
+        self.assertTrue(skill.can_handle("Do I need an umbrella in Seattle?"))
+        self.assertFalse(skill.can_handle("Tell me a joke."))
+
+    def test_weather_skill_execute_missing_location(self) -> None:
+        skill = WeatherSkill()
+
+        async def run() -> str:
+            return await skill.execute({"location": None})
+
+        result = asyncio.run(run())
+        self.assertIn("missing_location", result)
+
+
+class AgentRouterTests(unittest.TestCase):
+    def test_agent_uses_skill_heuristic_without_embed_model(self) -> None:
+        class DummySkill(Skill):
+            @property
+            def name(self) -> str:
+                return "dummy"
+
+            @property
+            def exemplars(self) -> list[str]:
+                return []
+
+            def can_handle(self, transcript: str) -> bool:
+                return "route-me" in transcript
+
+            def entities(self, transcript: str) -> dict:
+                return {}
+
+            async def execute(self, entities: dict) -> str:
+                return "ok"
+
+        agent = AgentProcessor(
+            config=VoiceConfig(),
+            skills=[DummySkill()],
+            embed_model_path=Path("/tmp/not-there.gguf"),
+        )
+
+        async def run() -> tuple[str | None, float, int]:
+            return await agent._classify("please route-me now")
+
+        label, score, classifier_ms = asyncio.run(run())
+        self.assertEqual(label, "dummy")
+        self.assertEqual(score, 1.0)
+        self.assertEqual(classifier_ms, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
-

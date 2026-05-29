@@ -17,6 +17,13 @@ Straylight is an agent bus: a personal voice assistant that runs entirely on loc
 - All other services (MCP tool servers, memory, gateway, Redis) run in **Docker Compose**.
 - The boundary is **Redis pub/sub**: voice publishes events; everything else subscribes.
 
+**Product direction:**
+- Personal appliance first; open-source dev kit second.
+- LAN browser UI served by the gateway, accessible from a phone or second screen on the local network. No desktop app.
+- Predictable setup over lowest latency — clean architecture over micro-optimisations.
+- All input surfaces (voice, browser text, future Signal/Discord/Telegram) talk to Cass through the same agent/event bus. No surface calls llama-server directly.
+- llama-server UI is a model diagnostics console for development. Normal usage routes through the Straylight gateway.
+
 ---
 
 ## Tech Stack
@@ -30,10 +37,9 @@ Straylight is an agent bus: a personal voice assistant that runs entirely on loc
 | STT | Pipecat `WhisperSTTService` (faster-whisper) | Models in `models/stt/` |
 | TTS | Pipecat `PiperTTSService` | Streaming, sentence-by-sentence; models in `models/tts/` |
 | Agent | **AgentProcessor** | Custom `FrameProcessor`; bridges Pipecat I/O to intelligence layer |
-| Fast-path classifier | **nomic-embed** via llama.cpp | Embedding similarity; inside AgentProcessor; not on conversational path |
+| Fast-path classifier | **nomic-embed** via llama-cpp-python | Embedding similarity; in-process inside AgentProcessor; no HTTP overhead |
 | Fast-path NER | **spaCy** (`en_core_web_sm`) | Entity extraction (location, time, quantity) for skills; ~20ms |
-| LLM — small | **llama-server** (2–4B model) | Tool response formatting on fast path; port 8081 |
-| LLM — large | **llama-server** (Qwen3.6) | Conversational responses + slow-path ReAct loop; port 8080 |
+| LLM | **llama-server** (Gemma 4, gemma-4-E4B) | Fast-path response formatting + slow-path ReAct loop; port 8080 |
 | Tool protocol | **MCP** (Model Context Protocol) | Standard tool interface; all tool services expose MCP endpoints |
 | Event bus | **Redis** pub/sub | Introduced Phase 4; voice → gateway IPC bridge |
 | Memory: episodic | **SQLite** | Full conversation turn log + extracted facts table; never truncated |
@@ -54,7 +60,7 @@ straylight/
 │   │   ├── agent.py            # AgentProcessor: fast path + slow path ReAct loop
 │   │   ├── skills/
 │   │   │   ├── __init__.py     # Skill base class + registry
-│   │   │   └── weather.py      # WeatherSkill (embed classify + spaCy + MCP + small LLM)
+│   │   │   └── weather.py      # WeatherSkill (embed classify + spaCy + MCP + Gemma 4)
 │   │   ├── publisher.py        # Redis event publisher (Phase 4)
 │   │   ├── cass_prompt.txt     # System prompt (Cass persona)
 │   │   └── requirements.txt
@@ -86,7 +92,7 @@ straylight/
 │   └── kuzu/                   # Kuzu data directory (mounted volume)
 ├── scripts/
 │   ├── download-models.sh
-│   └── dev.sh                  # Start both llama-server instances + docker compose + voice
+│   └── dev_gemma.sh            # Start Gemma 4 llama-server + docker compose + voice
 ├── tests/
 │   ├── test_voice_core.py
 │   └── ...
@@ -107,11 +113,11 @@ TranscriptionFrame arrives
 ├─ FAST PATH (high-confidence skill match)
 │   ├─ spaCy NER extracts entities from transcript (~20ms)
 │   ├─ Skill calls MCP tool server(s) directly
-│   ├─ Small LLM (port 8081, Cass-prompted) formats response from structured tool result
+│   ├─ Gemma 4 (port 8080, Cass-prompted) formats response from structured tool result
 │   └─ emit TextFrames → TTS
 │
 └─ SLOW PATH (conversational / ambiguous / multi-step)
-    ├─ Large LLM (Qwen3.6, port 8080) with MCP tool registry
+    ├─ Gemma 4 (port 8080) with MCP tool registry
     ├─ ReAct loop: reason → call tool → observe → reason → ... → done
     └─ emit TextFrames as they stream → TTS
 ```
@@ -120,7 +126,7 @@ TranscriptionFrame arrives
 - Embedding exemplars for the classifier
 - spaCy entity patterns
 - MCP tool call(s)
-- Small LLM format prompt for Cass's voice
+- Format prompt for Cass's voice (Gemma 4 formats all responses)
 
 Adding a skill never touches the classifier thresholds — it registers exemplars into the shared embedding index at startup.
 
@@ -168,31 +174,34 @@ Adding a skill never touches the classifier thresholds — it registers exemplar
 
 **Tricky requirements upfront:**
 - `AgentProcessor` replaces `OpenAILLMService` in the pipeline. The pipeline becomes: `LocalTransport → WakeWord → VAD → STT → AgentProcessor → PiperTTS → LocalTransport`. The `LLMContextAggregatorPair` used in Phase 1 is replaced — `AgentProcessor` owns context management internally. The `VADProcessor` from the Phase 1 fix remains as an explicit pipeline stage between `WakeWordProcessor` and `WhisperSTTService`; it is not embedded inside an aggregator pair.
-- nomic-embed runs via llama.cpp's `/v1/embeddings` endpoint on the same server as the small LLM (port 8081), not a separate process. Confirm the endpoint is available before building Phase 2c.
+- nomic-embed runs in-process via `llama-cpp-python` (`embedding=True`, model in `models/embed/`). No port 8081 server. The `Llama` object is held by `AgentProcessor` and called via `asyncio.to_thread()` to avoid blocking the pipeline event loop. Confirm the `.gguf` embed model is present and loads cleanly before building Phase 2c.
 - Whisper ASR output is not clean text — filler words (`um`, `uh`), disfluencies, and proper-noun errors shift the embedding distribution. Exemplars in the classifier must be collected from **real mic input through Whisper**, not typed. Typed text will not transfer. The measurement harness (step 2b) must use the same `VADParams` as the production pipeline — mismatched VAD boundary settings produce different Whisper segmentation and will corrupt the classifier's training distribution.
 - The `none / weather` boundary is the highest-risk bleed zone. Cover it explicitly with at least 10 ambiguous utterances in the corpus.
 - spaCy `en_core_web_sm` handles location names well but fails on implicit references ("near me", "here"). These fall through to the slow path — do not try to resolve them in the fast path.
-- The slow path large LLM (Qwen3.6) must not run concurrently with the small LLM (port 8081) if RAM is constrained. `AgentProcessor` holds a single `asyncio.Lock` shared between fast and slow paths; neither path starts inference while the other holds the lock. Remove the lock after profiling if concurrent inference is confirmed safe.
+- Only one llama-server instance (Gemma 4, port 8080). The nomic-embed classifier is in-process via `llama-cpp-python` and does not share an inference context with Gemma 4. `AgentProcessor` still holds an `asyncio.Lock` to prevent overlapping Gemma 4 calls between the fast-path formatter and slow-path reasoning loop. Remove the lock after profiling if the overlap never occurs in practice.
 - `AgentProcessor` owns context management internally via `ConversationWindow` (from `core.py`). `VoiceConfig.history_tokens` replaces `history_turns`: after each turn call llama.cpp `/tokenize` on the accumulated messages and drop oldest turn pairs until within cap. `ConversationWindow.add_turn()` is the trim mechanism; the unit changes from turns to tokens.
 - `AgentProcessor` must handle Pipecat interrupts cleanly: when a user barges in while Cass is speaking, cancel the current agent `asyncio.Task`, drain any pending `TextFrame`s, and reset to idle before processing the next `TranscriptionFrame`. The `awake_timeout_seconds` guard from Phase 1 is a safety net, not the primary interrupt mechanism.
 
 **Substeps:**
 
-2a. **Skill base class and registry** — `services/voice/skills/__init__.py`. Define `Skill` abstract base: `name`, `exemplars: list[str]`, `entities(transcript) → dict`, `execute(entities) → str`, `format_prompt`. `AgentProcessor.__init__` accepts `skills: list[Skill]`, builds shared embedding index from all exemplars at startup.
+2a. **Canonical event schemas** — `shared/straylight_shared/events.py`. Define dataclasses: `TranscriptEvent`, `IntentEvent`, `ToolCallEvent`, `ToolResultEvent`, `SpeakingEvent`, `StateEvent`. All include `session_id` and `timestamp_ms`. This is the contract for the gateway UI and future chat adapters — define it before `AgentProcessor` so publishing is consistent from the first working turn. *(Pulled forward from Phase 4a.)*
 
-2b. **Measurement harness** — `scripts/measure_router.py`. Records mic input, runs Whisper, scores against embedding index, appends JSONL: `{transcript, skill_label, score, gap, below_threshold}`. Used to calibrate fast-path thresholds before wiring into the live pipeline.
+2b. **Skill base class and registry** — `services/voice/skills/__init__.py`. Define `Skill` abstract base: `name`, `exemplars: list[str]`, `entities(transcript) → dict`, `execute(entities) → str`, `format_prompt`. `AgentProcessor.__init__` accepts `skills: list[Skill]`, builds shared embedding index from all exemplars at startup.
 
-2c. **Corpus collection** — 50–100 spoken utterances via the harness. Minimum 10 per class: `none`, `weather`. Minimum 10 for the `none/weather` boundary with natural disfluencies. Do not proceed to 2d without ≥ 90% accuracy on a held-out 20% split and stable gap distribution.
+2c. **Measurement harness** — `scripts/measure_router.py`. Records mic input, runs Whisper, scores against embedding index, appends JSONL: `{transcript, skill_label, score, gap, below_threshold}`. Used to calibrate fast-path thresholds before wiring into the live pipeline.
 
-2d. **`AgentProcessor`** — `services/voice/agent.py`. Custom `FrameProcessor`. On `TranscriptionFrame`: runs nomic-embed classifier; if skill match above threshold → fast path (spaCy NER → `skill.execute()` → small LLM format); else → slow path (Qwen3.6 ReAct loop, MCP tool registry). Streams `TextFrame`s to TTS as they arrive. Logs `path` (fast/slow), `skill_label`, `classifier_ms`, `agent_ms` per turn.
+2d. **Corpus collection** — 50–100 spoken utterances via the harness. Minimum 10 per class: `none`, `weather`. Minimum 10 for the `none/weather` boundary with natural disfluencies. Do not proceed to 2e without ≥ 90% accuracy on a held-out 20% split and stable gap distribution.
 
-2e. **`WeatherSkill` stub** — `services/voice/skills/weather.py`. Exemplars loaded, spaCy entity extraction implemented, `execute()` returns a placeholder string. Small LLM formats it in Cass's voice. Real MCP call wired in Phase 3.
+2e. **`AgentProcessor`** — `services/voice/agent.py`. Custom `FrameProcessor`. On `TranscriptionFrame`: runs nomic-embed classifier in-process (llama-cpp-python); if skill match above threshold → fast path (spaCy NER → `skill.execute()` → Gemma 4 single-shot format); else → slow path (Gemma 4 ReAct loop, MCP tool registry). Streams `TextFrame`s to TTS as they arrive. Publishes `TranscriptEvent`, `IntentEvent`, `SpeakingEvent`, and `StateEvent` via `publisher.py` on every turn. Logs `path` (fast/slow), `skill_label`, `classifier_ms`, `agent_ms` per turn.
 
-2f. **Wire into pipeline** — replace `OpenAILLMService` and aggregators in `main.py` with `AgentProcessor(skills=[WeatherSkill()])`. Startup validation adds: both llama-server instances healthy, nomic-embed `/v1/embeddings` endpoint responding.
+2f. **`WeatherSkill` stub** — `services/voice/skills/weather.py`. Exemplars loaded, spaCy entity extraction implemented, `execute()` returns a placeholder string. Gemma 4 formats it in Cass's voice. Real MCP call wired in Phase 3.
 
-2g. **`dev.sh` update** — start small model server (port 8081), health-check it. Start Qwen3.6 (port 8080), health-check it. Then docker compose, then voice service.
+2g. **Wire into pipeline** — replace `OpenAILLMService` and aggregators in `main.py` with `AgentProcessor(skills=[WeatherSkill()])`. Startup validation adds: Gemma 4 llama-server healthy on port 8080, nomic-embed `Llama` object loads from `models/embed/`.
+
+2h. **`dev_gemma.sh` update** — single Gemma 4 llama-server on port 8080, health-check it. Voice service loads nomic-embed in-process at startup. Then docker compose, then voice service. `dev.sh` is archived (was tuned for the prior MoE model).
 
 **A feature is complete when:**
+- [ ] Event schemas in `shared/straylight_shared/events.py`; all fields match what `AgentProcessor` publishes
 - [ ] `AgentProcessor` in pipeline; `OpenAILLMService` removed
 - [ ] Corpus has ≥ 50 utterances, ≥ 10 per class, covers `none/weather` boundary; accuracy ≥ 90% on held-out 20%
 - [ ] Fast/slow path split working: weather utterances hit fast path; conversational utterances hit slow path
@@ -205,15 +214,15 @@ Adding a skill never touches the classifier thresholds — it registers exemplar
 
 ### Phase 3 — Tools & MCP
 
-**Goal:** "What's the weather in London?" works end-to-end by voice. Weather service is an MCP server. Both the fast path (WeatherSkill) and the slow path (Qwen3.6 ReAct) can call it. Docker Compose introduced here.
+**Goal:** "What's the weather in London?" works end-to-end by voice. Weather service is an MCP server. Both the fast path (WeatherSkill) and the slow path (Gemma 4 ReAct) can call it. Docker Compose introduced here.
 
 **Depends on:** Phase 2 complete. `AgentProcessor` stable. `WeatherSkill` stub responding. Latency numbers acceptable end-to-end.
 
 **Tricky requirements upfront:**
 - The weather service is an **MCP server**, not a plain FastAPI endpoint. Use `fastapi-mcp` to expose the existing FastAPI handler as an MCP tool. This keeps the HTTP handler testable while making it discoverable by the slow-path large LLM via `tools/list`.
 - Open-Meteo requires a geocoding step (city name → lat/lon). Verify `imported_code/backend/weather.py` handles this before wrapping. Do not re-implement geocoding.
-- The **fast path does not call Qwen3.6**. `WeatherSkill.execute()` calls the MCP weather tool directly. The small LLM (port 8081) formats the response in Cass's voice from the structured JSON result. Qwen3.6 is not invoked. Verify this via llama-server request logs on port 8080.
-- The **slow path discovers tools dynamically**. Qwen3.6 calls `tools/list` on the MCP registry at the start of each slow-path turn. New tools appear automatically. No hardcoded tool list in the agent loop.
+- The **fast path does not trigger a ReAct loop**. `WeatherSkill.execute()` calls the MCP weather tool directly. Gemma 4 (port 8080) only formats the structured tool result in Cass's voice — single-shot, no tool discovery. Fast-path calls are short; verify via llama-server request logs (low token count, no tool schema in prompt).
+- The **slow path discovers tools dynamically**. Gemma 4 calls `tools/list` on the MCP registry at the start of each slow-path turn. New tools appear automatically. No hardcoded tool list in the agent loop.
 - All tool failures must produce a spoken response. If the weather MCP server is unreachable or returns an error, `AgentProcessor` catches the exception and speaks a fallback. Silent failure is not acceptable.
 - The native voice process calls MCP servers at `http://localhost:<port>`. Docker's port mapping makes this work. Confirm explicitly before wiring.
 
@@ -225,14 +234,14 @@ Adding a skill never touches the classifier thresholds — it registers exemplar
 
 3c. **`WeatherSkill.execute()` real implementation** — replace stub with MCP call to weather server. Pass extracted location entity from spaCy. Handle `location=None` gracefully (ask user to repeat with a location).
 
-3d. **Slow path MCP registry** — `AgentProcessor` slow path constructs MCP client, calls `tools/list` on registered servers at turn start. Qwen3.6 receives tool schemas in its system context. ReAct loop handles tool call / observation cycles.
+3d. **Slow path MCP registry** — `AgentProcessor` slow path constructs MCP client, calls `tools/list` on registered servers at turn start. Gemma 4 receives tool schemas in its system context. ReAct loop handles tool call / observation cycles.
 
-3e. **Latency measurement** — log `tool_call_ms` (MCP round-trip), `format_ms` (small LLM formatting), `total_weather_ms` (wake → first TTS audio) per weather turn.
+3e. **Latency measurement** — log `tool_call_ms` (MCP round-trip), `format_ms` (Gemma 4 formatting), `total_weather_ms` (wake → first TTS audio) per weather turn.
 
 **A feature is complete when:**
 - [ ] `docker compose up weather` starts cleanly; `tools/list` returns `get_weather` schema
 - [ ] Cass correctly answers "What's the weather in London?" end-to-end by voice
-- [ ] Fast path handles the request: Qwen3.6 **not** called (verified via llama-server logs on port 8080)
+- [ ] Fast path handles the request: no Gemma 4 ReAct loop triggered (verified via llama-server logs; fast-path call is single-shot format, low token count)
 - [ ] Slow path also handles weather if fast-path classifier scores below threshold
 - [ ] Tool failure spoken: if weather server unreachable, Cass says she can't reach it; no crash, no silence
 - [ ] `tool_call_ms`, `format_ms`, `total_weather_ms` logged per weather turn
@@ -257,17 +266,15 @@ Adding a skill never touches the classifier thresholds — it registers exemplar
 
 **Substeps:**
 
-4a. **Canonical event schemas** — `shared/straylight_shared/events.py`. Define dataclasses for: `TranscriptEvent`, `IntentEvent`, `ToolCallEvent`, `ToolResultEvent`, `SpeakingEvent`, `StateEvent`. All events include `session_id` and `timestamp_ms`.
+4a. **Redis publisher** — `services/voice/publisher.py`. `AgentProcessor` publishes to `cass:transcript`, `cass:intent`, `cass:tool_call`, `cass:tool_result`, `cass:speaking`, `cass:state` after each relevant event. Event schemas defined in Phase 2a; this step wires the live Redis connection. All published events conform to schemas in `shared/straylight_shared/events.py`.
 
-4b. **Redis publisher** — `services/voice/publisher.py`. `AgentProcessor` publishes to `cass:transcript`, `cass:intent`, `cass:tool_call`, `cass:tool_result`, `cass:speaking`, `cass:state` after each relevant event. All published events conform to schemas in `events.py`.
+4b. **Docker Compose: Redis** — `redis:alpine`, port 6379 exposed on localhost. Config in `infra/redis/redis.conf`.
 
-4c. **Docker Compose: Redis** — `redis:alpine`, port 6379 exposed on localhost. Config in `infra/redis/redis.conf`.
+4c. **Gateway service** — `services/gateway/main.py`. FastAPI. `GET /events` SSE endpoint subscribes to all `cass:*` channels via `aioredis`, fans out to connected SSE clients. `POST /input` accepts `{text: str}`, publishes to `cass:input` channel.
 
-4d. **Gateway service** — `services/gateway/main.py`. FastAPI. `GET /events` SSE endpoint subscribes to all `cass:*` channels via `aioredis`, fans out to connected SSE clients. `POST /input` accepts `{text: str}`, publishes to `cass:input` channel.
+4d. **Voice: input subscriber** — `main.py` restructured: `asyncio.gather(runner.run(task), redis_input_subscriber(task))`. Subscriber receives `cass:input` messages and calls `await task.queue_frame(TranscriptionFrame(...))`, bypassing wake word and STT.
 
-4e. **Voice: input subscriber** — `main.py` restructured: `asyncio.gather(runner.run(task), redis_input_subscriber(task))`. Subscriber receives `cass:input` messages and calls `await task.queue_frame(TranscriptionFrame(...))`, bypassing wake word and STT.
-
-4f. **Browser UI** — `frontend/`. Minimal HTML + vanilla JS. Displays: state badge (idle / listening / thinking / speaking), latest transcript, skill/intent label, tool call log. Auto-reconnects SSE on disconnect. No audio. Bind to `0.0.0.0` for LAN access.
+4e. **Browser UI** — `frontend/`. LAN operator surface — not a chat app, not a llama-server clone. Minimal HTML + vanilla JS. Displays: Cass state badge (idle / listening / thinking / speaking), live transcript, path/skill label, tool call timeline, latency counters. Text input sends `POST /input` to inject into the same voice/agent loop (bypasses wake word and STT). Auto-reconnects SSE on disconnect. Served on `0.0.0.0` for LAN access. No auth (Phase 6). No browser mic — native wake listener is the primary voice path. Style reference: `imported_code/frontend/`.
 
 **A feature is complete when:**
 - [ ] Redis starts via `docker compose up redis`; `AgentProcessor` publishes events on every turn
@@ -308,7 +315,7 @@ Kuzu (embedded graph DB, no server process)
 
 **Retrieval** uses nomic-embed to embed the current transcript, finds the nearest entity nodes in Kuzu by vector similarity, traverses relationships up to depth 2, and serializes the subgraph as natural language facts injected into the agent's context. Token cap enforced via llama.cpp `/tokenize` endpoint.
 
-**Memory as MCP.** The retrieval API is an MCP server. Both the fast path (`MemorySkill`) and the slow-path Qwen3.6 ReAct loop can query it via `tools/list`.
+**Memory as MCP.** The retrieval API is an MCP server. Both the fast path (`MemorySkill`) and the slow-path Gemma 4 ReAct loop can query it via `tools/list`.
 
 **Tricky requirements upfront:**
 - Sleep consolidation must be **fully isolated from the voice pipeline**. If the worker crashes or is slow, the voice pipeline is unaffected. The worker subscribes to Redis events; the pipeline never waits on it.
@@ -323,13 +330,13 @@ Kuzu (embedded graph DB, no server process)
 
 5b. **Graph store** — `services/memory/graph.py`. Kuzu interface: `upsert_entity()`, `upsert_relationship()`, `query_neighbors(entity_name, depth=2)`, `rebuild_from_facts(db_path)`. `rebuild_from_facts` reloads all rows from SQLite `facts` table into a fresh Kuzu database — no LLM calls.
 
-5c. **Sleep consolidation worker** — `services/memory/sleep.py`. Separate process. Subscribes to `cass:state` on Redis. On idle timeout (default 5 min): reads unprocessed turns from SQLite since `last_consolidated_turn_id`. Calls Qwen3.6 (port 8080) with entity/relationship extraction prompt. Checks `cass:state` before each LLM call; backs off if pipeline active. Writes extracted triples to SQLite `facts`. Upserts into Kuzu. Deduplicates relationships via nomic-embed cosine similarity. Updates `last_consolidated_turn_id`.
+5c. **Sleep consolidation worker** — `services/memory/sleep.py`. Separate process. Subscribes to `cass:state` on Redis. On idle timeout (default 5 min): reads unprocessed turns from SQLite since `last_consolidated_turn_id`. Calls Gemma 4 (port 8080) with entity/relationship extraction prompt. Checks `cass:state` before each LLM call; backs off if pipeline active. Writes extracted triples to SQLite `facts`. Upserts into Kuzu. Deduplicates relationships via nomic-embed cosine similarity. Updates `last_consolidated_turn_id`.
 
 5d. **Memory MCP server** — `services/memory/api/main.py`. FastAPI + `fastapi-mcp`. Tool: `retrieve_memory(query: str, limit: int = 5)`. Embeds query via nomic-embed, queries Kuzu entity nodes, traverses neighbors depth-2, serializes subgraph as `[{fact_text, confidence, session_id, extracted_at}]`.
 
-5e. **`MemorySkill`** — `services/voice/skills/memory.py`. Fast-path skill for explicit memory queries ("do you remember when I told you…", "what do I usually…"). Calls `retrieve_memory` MCP tool directly. Small LLM formats retrieved facts in Cass's voice.
+5e. **`MemorySkill`** — `services/voice/skills/memory.py`. Fast-path skill for explicit memory queries ("do you remember when I told you…", "what do I usually…"). Calls `retrieve_memory` MCP tool directly. Gemma 4 formats retrieved facts in Cass's voice.
 
-5f. **Slow-path context injection** — `AgentProcessor` slow path calls `retrieve_memory` at the start of every turn before the Qwen3.6 call. Injects serialized facts into the system context. Enforces token cap. Logs `retrieval_ms` and `injected_tokens` per turn.
+5f. **Slow-path context injection** — `AgentProcessor` slow path calls `retrieve_memory` at the start of every turn before the Gemma 4 call. Injects serialized facts into the system context. Enforces token cap. Logs `retrieval_ms` and `injected_tokens` per turn.
 
 5g. **Replay command** — `scripts/rebuild_graph.sh`. Calls `graph.rebuild_from_facts()` against the SQLite database. Wipes Kuzu and rebuilds from scratch in a single command. No LLM calls.
 
@@ -360,6 +367,23 @@ Kuzu (embedded graph DB, no server process)
 
 ---
 
+## Architecture Decisions
+
+### LLM: Gemma 4 (gemma-4-E4B-it-UD-Q4_K_XL)
+Gemma 4 replaced Qwen3.6 as the primary LLM. At ~2.5 GB (Q4_K_XL), it fits comfortably alongside the audio pipeline and is fast enough to handle both fast-path response formatting and slow-path ReAct reasoning on a single server (port 8080). The two-model split (separate large + small instances) is dropped — one model, one port. `dev_gemma.sh` is the active dev launcher; `dev.sh` is archived (was tuned for a prior MoE model with `--n-cpu-moe` and an 80k context window).
+
+### Qwen3.6: reserved for high-context and complex reasoning tasks
+Qwen3.6 is not active in the current stack but should not be written off. Its large native context window (claimed 128k+) makes it a candidate for tasks where Gemma 4's context budget is insufficient — memory consolidation over long conversation histories, long-document ingestion, or deep multi-hop reasoning chains where the ReAct loop needs more working room than Gemma 4 comfortably provides. It could also be worth trialling for questions that Gemma 4 demonstrably fumbles: highly technical, multi-step, or ambiguous queries where a larger model would hold more intermediate state. If it becomes relevant, run it as a second llama-server instance (a different port) invoked selectively by `AgentProcessor`, not as a replacement for Gemma 4.
+
+### Embedding classifier: llama-cpp-python (in-process)
+Researched May 2026. `pyllamacpp` (`nomic-ai/pygpt4all`) is dead — archived May 2023. Do not use.
+
+`llama-cpp-python` (`abetlen/llama-cpp-python`) is actively maintained (10k+ stars, 345 releases, updated continuously). It releases the GIL during inference and is `asyncio.to_thread()` compatible. Decision: nomic-embed runs in-process via `llama-cpp-python` (`embedding=True`, model in `models/embed/`). Benefits: no port 8081 server, simplified `dev_gemma.sh` startup, no HTTP round-trip on every classifier call.
+
+Gemma 4 stays as an external llama-server process — pre-compiled with GPU flags, independently restartable, and process-isolated from the voice pipeline.
+
+---
+
 ## Pro Tips
 
 **Pipecat owns audio. `AgentProcessor` owns intelligence.** Keep this separation absolute. No reasoning, no tool calls, no memory access inside any Pipecat built-in service. The pipeline is audio I/O; the agent is everything else.
@@ -368,7 +392,7 @@ Kuzu (embedded graph DB, no server process)
 
 **Phase ordering is load-bearing.** Each phase adds latency to the hot path. Measure Phase 1 TTFB before Phase 2. Measure Phase 2 end-to-end before Phase 3. Fix baseline latency before adding layers.
 
-**Two llama-server instances, two ports.** Port 8081 (small model, fast) for skill response formatting. Port 8080 (Qwen3.6) for slow-path reasoning and sleep consolidation. `dev.sh` starts and health-checks both in order. The small model should never receive a slow-path reasoning task; the large model should never be called on the fast path. Verify via server logs.
+**Single llama-server, single port.** Gemma 4 (port 8080) handles both fast-path response formatting and slow-path reasoning. nomic-embed runs in-process via `llama-cpp-python`. `dev_gemma.sh` starts and health-checks the single Gemma 4 instance. Distinguish path usage in logs via the `path` field — fast-path calls are short single-shot prompts; slow-path calls are full ReAct chains.
 
 **MCP is the tool interface.** Every tool — weather, memory retrieval, future tools — exposes an MCP endpoint. The slow-path agent discovers them via `tools/list`. Adding a new tool means writing an MCP server and registering it; no changes to `AgentProcessor`.
 

@@ -1,0 +1,529 @@
+"""AgentProcessor — Phase 2 intelligence layer for Straylight.
+
+Replaces OpenAILLMService in the Pipecat pipeline.
+Receives TranscriptionFrame, routes via fast or slow path, emits TextFrames
+for PiperTTSService.
+
+Fast path (nomic-embed confidence >= threshold, known skill):
+    nomic-embed classifier → Skill.entities() → Skill.execute() →
+    Gemma 4 single-shot formatter → TextFrame
+
+Slow path (low confidence, no skill match, or no embed model):
+    ConversationWindow → Gemma 4 streaming → TextFrame per chunk
+
+Pipeline position:
+    ... → WhisperSTTService → AgentProcessor → PiperTTSService → ...
+
+AgentProcessor consumes TranscriptionFrame (does not push it forward).
+All other frame types are passed through unchanged.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import math
+import time
+import uuid
+from pathlib import Path
+from typing import AsyncIterator
+
+import httpx
+from loguru import logger
+
+from pipecat.frames.frames import (
+    Frame,
+    InterruptionFrame,
+    TextFrame,
+    TranscriptionFrame,
+    UserStartedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+from shared.straylight_shared.events import (
+    IntentEvent,
+    SpeakingEvent,
+    StateEvent,
+    TranscriptEvent,
+)
+
+from . import publisher
+from .core import ConversationWindow, VoiceConfig, load_system_prompt
+from .skills import Skill, SkillExecutionError
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+# ---------------------------------------------------------------------------
+# AgentProcessor
+# ---------------------------------------------------------------------------
+
+class AgentProcessor(FrameProcessor):
+    """Custom FrameProcessor: TranscriptionFrame in, TextFrame(s) out.
+
+    Holds the nomic-embed Llama object (in-process, embedding=True) and
+    calls it via asyncio.to_thread() to avoid blocking the event loop.
+    Holds an asyncio.Lock to prevent overlapping Gemma 4 calls between the
+    fast-path formatter and the slow-path ReAct loop.
+
+    Args:
+        config:          VoiceConfig from environment.
+        skills:          Registered Skill instances. AgentProcessor builds
+                         the embedding index from their exemplars at startup.
+        embed_model_path: Path to nomic-embed .gguf file. If None or missing,
+                         the classifier is disabled and all queries route to
+                         the slow path.
+        none_exemplars:  Negative exemplars (label="none") for the classifier.
+                         Collect from real mic input via measure_router.py.
+        threshold:       Minimum cosine similarity score for a fast-path hit.
+        min_gap:         Minimum score gap between 1st and 2nd exemplar match.
+                         Prevents low-confidence routing when two skills score
+                         similarly.
+        session_id:      Unique identifier for this session. Included in all
+                         published events. Auto-generated if not provided.
+    """
+
+    DEFAULT_THRESHOLD: float = 0.80
+    DEFAULT_MIN_GAP: float = 0.05
+
+    def __init__(
+        self,
+        *,
+        config: VoiceConfig,
+        skills: list[Skill] | None = None,
+        embed_model_path: Path | None = None,
+        none_exemplars: list[str] | None = None,
+        threshold: float = DEFAULT_THRESHOLD,
+        min_gap: float = DEFAULT_MIN_GAP,
+        session_id: str | None = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(**kwargs)
+
+        self._config = config
+        self._skills: list[Skill] = list(skills or [])
+        self._embed_model_path = embed_model_path
+        self._none_exemplars: list[str] = list(none_exemplars or [])
+        self._threshold = threshold
+        self._min_gap = min_gap
+        self._session_id = session_id or uuid.uuid4().hex[:12]
+
+        # Conversation context (AgentProcessor owns this; no LLMContextAggregatorPair)
+        system_prompt = load_system_prompt(config.prompt_path)
+        self._conversation = ConversationWindow(
+            system_prompt=system_prompt,
+            history_turns=config.history_turns,
+        )
+
+        # Lazy-initialised embed state
+        self._llama: object | None = None           # llama_cpp.Llama | None
+        self._exemplar_index: list[tuple[str, str, list[float]]] = []
+        self._initialized: bool = False
+        self._init_lock: asyncio.Lock = asyncio.Lock()
+
+        # Serialise Gemma 4 calls (fast-path formatter + slow-path loop share one server)
+        self._llm_lock: asyncio.Lock = asyncio.Lock()
+
+        # Current processing task — cancelled on barge-in / interrupt
+        self._current_task: asyncio.Task | None = None  # type: ignore[type-arg]
+
+    # ------------------------------------------------------------------
+    # FrameProcessor protocol
+    # ------------------------------------------------------------------
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.DOWNSTREAM:
+            # Cancel any in-flight turn before starting the next one.
+            await self._cancel_current()
+            text = frame.text.strip()
+            if text:
+                self._current_task = asyncio.create_task(self._process_turn(text))
+            # Do not push TranscriptionFrame further; AgentProcessor is the consumer.
+            return
+
+        if isinstance(frame, (UserStartedSpeakingFrame, InterruptionFrame)):
+            # Barge-in or explicit interrupt — cancel current processing.
+            await self._cancel_current()
+            # Pass through so WakeWordProcessor and TTS can react.
+            await self.push_frame(frame, direction)
+            return
+
+        await self.push_frame(frame, direction)
+
+    # ------------------------------------------------------------------
+    # Interrupt / cancel
+    # ------------------------------------------------------------------
+
+    async def _cancel_current(self) -> None:
+        if self._current_task and not self._current_task.done():
+            self._current_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._current_task
+        self._current_task = None
+
+    # ------------------------------------------------------------------
+    # Lazy initialisation — embed model + exemplar index
+    # ------------------------------------------------------------------
+
+    async def _ensure_ready(self) -> None:
+        """Load the embed model and build the exemplar index on first use."""
+        if self._initialized:
+            return
+        async with self._init_lock:
+            if self._initialized:
+                return
+            await self._load_embed_model()
+            self._initialized = True
+
+    async def _load_embed_model(self) -> None:
+        if not self._embed_model_path or not self._embed_model_path.exists():
+            logger.info(
+                "agent: embed model not found at {}; slow path for all queries",
+                self._embed_model_path,
+            )
+            return
+
+        try:
+            self._llama = await asyncio.to_thread(self._load_llama_sync)
+            logger.info("agent: embed model loaded from {}", self._embed_model_path)
+        except Exception as exc:
+            logger.warning("agent: embed model load failed ({}); slow path only", exc)
+            self._llama = None
+            return
+
+        all_pairs: list[tuple[str, str]] = []
+        for skill in self._skills:
+            all_pairs.extend((ex, skill.name) for ex in skill.exemplars)
+        for ex in self._none_exemplars:
+            all_pairs.append((ex, "none"))
+
+        if not all_pairs:
+            logger.info("agent: no exemplars registered; slow path for all queries")
+            return
+
+        try:
+            self._exemplar_index = await asyncio.to_thread(
+                self._embed_pairs_sync, all_pairs
+            )
+            skill_count = sum(1 for _, label, _ in self._exemplar_index if label != "none")
+            none_count = len(self._exemplar_index) - skill_count
+            logger.info(
+                "agent: {} exemplars indexed ({} skill, {} none)",
+                len(self._exemplar_index),
+                skill_count,
+                none_count,
+            )
+        except Exception as exc:
+            logger.warning("agent: exemplar indexing failed ({}); slow path only", exc)
+            self._exemplar_index = []
+
+    def _load_llama_sync(self) -> object:
+        """Synchronous Llama constructor — runs in a thread to avoid blocking."""
+        from llama_cpp import Llama  # type: ignore[import]
+        return Llama(
+            model_path=str(self._embed_model_path),
+            embedding=True,
+            n_ctx=512,
+            n_threads=4,
+            verbose=False,
+        )
+
+    def _embed_pairs_sync(
+        self, pairs: list[tuple[str, str]]
+    ) -> list[tuple[str, str, list[float]]]:
+        """Embed all (text, label) pairs synchronously. Runs in a thread."""
+        result: list[tuple[str, str, list[float]]] = []
+        for text, label in pairs:
+            emb: list[float] = self._llama.create_embedding(text)["data"][0]["embedding"]  # type: ignore[union-attr]
+            result.append((text, label, emb))
+        return result
+
+    def _embed_sync(self, text: str) -> list[float]:
+        """Embed a single text synchronously. Runs in a thread."""
+        return self._llama.create_embedding(text)["data"][0]["embedding"]  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Classification
+    # ------------------------------------------------------------------
+
+    async def _classify(self, text: str) -> tuple[str | None, float, int]:
+        """Classify a transcript against registered skill exemplars.
+
+        Returns:
+            (skill_label, best_score, classifier_ms)
+            skill_label is None when routing to the slow path.
+        """
+        if self._llama is None or not self._exemplar_index:
+            heuristic_skill = self._heuristic_route(text)
+            if heuristic_skill is not None:
+                return heuristic_skill, 1.0, 0
+            return None, 0.0, 0
+
+        t0 = time.perf_counter()
+        try:
+            emb = await asyncio.to_thread(self._embed_sync, text)
+        except Exception as exc:
+            logger.warning("agent: embed failed ({}); slow path", exc)
+            return None, 0.0, 0
+        classifier_ms = round((time.perf_counter() - t0) * 1000)
+
+        scored = sorted(
+            (
+                (label, _cosine_similarity(emb, ex_emb))
+                for _, label, ex_emb in self._exemplar_index
+            ),
+            key=lambda t: t[1],
+            reverse=True,
+        )
+
+        best_label, best_score = scored[0]
+        second_score = scored[1][1] if len(scored) > 1 else 0.0
+        gap = best_score - second_score
+
+        logger.debug(
+            "classifier: best={!r} score={:.3f} gap={:.3f} ms={}",
+            best_label, best_score, gap, classifier_ms,
+        )
+
+        # Fast path only if: known skill, score >= threshold, gap sufficient.
+        if (
+            best_label != "none"
+            and best_score >= self._threshold
+            and gap >= self._min_gap
+        ):
+            skill = next((s for s in self._skills if s.name == best_label), None)
+            if skill is not None:
+                return best_label, best_score, classifier_ms
+
+        return None, best_score, classifier_ms
+
+    def _heuristic_route(self, text: str) -> str | None:
+        """Fallback router used when embed classification is unavailable."""
+        for skill in self._skills:
+            try:
+                if skill.can_handle(text):
+                    return skill.name
+            except Exception as exc:
+                logger.debug("agent: heuristic route failed for {} ({})", skill.name, exc)
+        return None
+
+    # ------------------------------------------------------------------
+    # Main turn handler
+    # ------------------------------------------------------------------
+
+    async def _process_turn(self, transcript: str) -> None:
+        await self._ensure_ready()
+        t_turn_start = time.perf_counter()
+
+        # --- Classify ---------------------------------------------------
+        skill_label, score, classifier_ms = await self._classify(transcript)
+        path = "fast" if skill_label is not None else "slow"
+
+        # --- Publish pre-LLM events -----------------------------------
+        await publisher.publish(
+            TranscriptEvent(text=transcript, session_id=self._session_id)
+        )
+        await publisher.publish(
+            IntentEvent(
+                path=path,
+                skill_label=skill_label,
+                confidence=score,
+                classifier_ms=classifier_ms,
+                session_id=self._session_id,
+            )
+        )
+        await publisher.publish(StateEvent(state="thinking", session_id=self._session_id))
+
+        # --- Generate and stream response ----------------------------
+        full_response_parts: list[str] = []
+
+        try:
+            async with self._llm_lock:
+                async for chunk in self._generate_response(transcript, path, skill_label):
+                    if not full_response_parts:
+                        # First chunk: signal start of speaking
+                        await publisher.publish(
+                            SpeakingEvent(
+                                state="start", text="", session_id=self._session_id
+                            )
+                        )
+                        await publisher.publish(
+                            StateEvent(state="speaking", session_id=self._session_id)
+                        )
+                    full_response_parts.append(chunk)
+                    await self.push_frame(
+                        TextFrame(text=chunk), FrameDirection.DOWNSTREAM
+                    )
+
+        except asyncio.CancelledError:
+            logger.debug("agent: turn cancelled (barge-in)")
+            raise
+
+        except Exception as exc:
+            logger.error("agent: unhandled error in turn: {}", exc)
+            raise
+
+        full_response = "".join(full_response_parts)
+
+        # --- Update conversation history --------------------------------
+        if full_response:
+            self._conversation.add_turn(transcript, full_response)
+
+        # --- Token count (log only; trimming via history_turns) --------
+        token_count = await self._count_tokens()
+
+        # --- Publish post-turn events ----------------------------------
+        agent_ms = round((time.perf_counter() - t_turn_start) * 1000)
+
+        await publisher.publish(
+            SpeakingEvent(
+                state="stop", text=full_response, session_id=self._session_id
+            )
+        )
+        await publisher.publish(StateEvent(state="idle", session_id=self._session_id))
+
+        logger.info(
+            json.dumps(
+                {
+                    "event": "agent_turn",
+                    "path": path,
+                    "skill_label": skill_label,
+                    "classifier_ms": classifier_ms,
+                    "agent_ms": agent_ms,
+                    "history_tokens": token_count,
+                }
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Response generator — unified entry for fast and slow paths
+    # ------------------------------------------------------------------
+
+    async def _generate_response(
+        self, transcript: str, path: str, skill_label: str | None
+    ) -> AsyncIterator[str]:
+        """Yield response chunks. Falls back to slow path on skill failure."""
+        if path == "fast" and skill_label is not None:
+            skill = next((s for s in self._skills if s.name == skill_label), None)
+            if skill is not None:
+                try:
+                    text = await self._run_fast_path(transcript, skill)
+                    if text:
+                        yield text
+                    return
+                except SkillExecutionError as exc:
+                    logger.warning(
+                        "agent: skill {!r} failed ({}); speaking fallback",
+                        skill_label, exc,
+                    )
+                    if skill_label == "weather":
+                        yield (
+                            "I hit turbulence reaching the weather grid. "
+                            "Try again in a moment."
+                        )
+                    else:
+                        yield "Tooling glitched. Try that again in a moment."
+                    return
+                except Exception as exc:
+                    logger.warning(
+                        "agent: fast path error ({}); speaking fallback", exc
+                    )
+                    yield "Something glitched in the fast lane. Say it again."
+                    return
+
+        # Slow path (Gemma 4 streaming)
+        messages = self._conversation.build_messages(transcript)
+        async for chunk in self._llm_stream(messages):
+            yield chunk
+
+    # ------------------------------------------------------------------
+    # Fast path
+    # ------------------------------------------------------------------
+
+    async def _run_fast_path(self, transcript: str, skill: Skill) -> str:
+        """Run entity extraction → skill execute → Gemma 4 format."""
+        entities = skill.entities(transcript)
+        raw_result = await skill.execute(entities)
+
+        messages = [
+            {"role": "system", "content": skill.format_prompt},
+            {"role": "user", "content": raw_result},
+        ]
+        return await self._llm_single_shot(messages)
+
+    # ------------------------------------------------------------------
+    # LLM helpers
+    # ------------------------------------------------------------------
+
+    async def _llm_stream(self, messages: list[dict]) -> AsyncIterator[str]:
+        """Stream Gemma 4 completions, yielding text chunks as they arrive."""
+        url = f"{self._config.llm_base_url}/v1/chat/completions"
+        payload = {
+            "model": self._config.llm_model,
+            "messages": messages,
+            "stream": True,
+            "temperature": 0.7,
+        }
+        async with httpx.AsyncClient() as client:
+            async with client.stream("POST", url, json=payload, timeout=60.0) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                        delta = obj["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            yield delta
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+
+    async def _llm_single_shot(self, messages: list[dict]) -> str:
+        """Single non-streaming Gemma 4 call for fast-path response formatting."""
+        url = f"{self._config.llm_base_url}/v1/chat/completions"
+        payload = {
+            "model": self._config.llm_model,
+            "messages": messages,
+            "stream": False,
+            "temperature": 0.3,
+            "max_tokens": 200,
+        }
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload, timeout=30.0)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+
+    async def _count_tokens(self) -> int:
+        """Count tokens in current conversation history via llama.cpp /tokenize.
+
+        Returns -1 on failure (server unavailable or endpoint missing).
+        """
+        messages = self._conversation.build_messages("")
+        text = " ".join(m.get("content", "") for m in messages if m.get("content"))
+        url = f"{self._config.llm_base_url}/tokenize"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url, json={"content": text}, timeout=5.0
+                )
+                resp.raise_for_status()
+                return len(resp.json().get("tokens", []))
+        except Exception:
+            return -1

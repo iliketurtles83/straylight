@@ -4,3 +4,7 @@ pipecat-ai[local,silero,whisper,openai,piper]
 # 0.4.0 is the latest known-good release for this environment.
 openwakeword==0.4.0
 httpx
+# In-process nomic-embed classifier (AgentProcessor, Phase 2).
+# Requires the nomic-embed .gguf model in models/embed/.
+# Releases the GIL during inference — asyncio.to_thread() compatible.
+llama-cpp-python

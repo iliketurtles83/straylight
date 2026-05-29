@@ -38,6 +38,10 @@ class VoiceConfig:
     input_device_name: str | None = None
     output_device_name: str | None = None
     history_turns: int = 6
+    embed_model_path: Path = _BASE_DIR / "models" / "embed" / "nomic-embed-text-v1.5.f16.gguf"
+    router_exemplars_path: Path = _BASE_DIR / "exemplars.jsonl"
+    router_threshold: float = 0.80
+    router_min_gap: float = 0.05
     listen_mode: bool = False  # skip wake word; pipeline always active
 
     @classmethod
@@ -45,6 +49,15 @@ class VoiceConfig:
         prompt_path = Path(os.getenv("CASS_PROMPT_PATH", str(_BASE_DIR / "services" / "voice" / "cass_prompt.txt")))
         wake_model_dir = Path(os.getenv("CASS_WAKE_MODEL_DIR", str(_BASE_DIR / "models" / "wake")))
         tts_model_path = Path(os.getenv("TTS_PIPER_MODEL", str(_BASE_DIR / "models" / "tts" / "en_US-amy-medium.onnx")))
+        embed_model_path = Path(
+            os.getenv(
+                "CASS_EMBED_MODEL_PATH",
+                str(_BASE_DIR / "models" / "embed" / "nomic-embed-text-v1.5.f16.gguf"),
+            )
+        )
+        router_exemplars_path = Path(
+            os.getenv("CASS_EXEMPLARS_PATH", str(_BASE_DIR / "exemplars.jsonl"))
+        )
         ack_raw = os.getenv("CASS_ACK_SOUND_PATH", "").strip()
         ack_sound_path = Path(ack_raw) if ack_raw else _BASE_DIR / "models" / "tts" / "ack.mp3"
 
@@ -69,6 +82,10 @@ class VoiceConfig:
             input_device_name=_env_optional_str("CASS_INPUT_DEVICE_NAME"),
             output_device_name=_env_optional_str("CASS_OUTPUT_DEVICE_NAME"),
             history_turns=_env_int("CASS_HISTORY_TURNS", 6),
+            embed_model_path=embed_model_path,
+            router_exemplars_path=router_exemplars_path,
+            router_threshold=_env_float("CASS_ROUTER_THRESHOLD", 0.80),
+            router_min_gap=_env_float("CASS_ROUTER_MIN_GAP", 0.05),
             listen_mode=os.getenv("CASS_LISTEN_MODE", "").strip().lower() in ("1", "true", "yes"),
         )
 

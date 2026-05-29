@@ -158,7 +158,7 @@ class WakeWordProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        logger.debug("wake: got frame type={}", type(frame).__name__)
+        # logger.debug("wake: got frame type={}", type(frame).__name__)
 
         if isinstance(frame, InputAudioRawFrame):
             if self._state is _State.sleeping:

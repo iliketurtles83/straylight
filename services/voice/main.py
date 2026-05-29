@@ -1,18 +1,18 @@
-"""Straylight voice service — Phase 1 entry point.
+"""Straylight voice service entry point.
 
 Wires a Pipecat pipeline:
   LocalAudioTransport.input()
   → [WakeWordProcessor]   (omitted in --listen mode)
+  → VADProcessor
   → WhisperSTTService
-  → LLMContextAggregator (user)
-  → OpenAILLMService   (llama-server backend)
+  → AgentProcessor
   → PiperTTSService
+  → WakeResetRelay
   → LatencyObserver
   → LocalAudioTransport.output()
-  → LLMContextAggregator (assistant)
 
 Run via:
-  python -m voice.main [--no-validate] [--listen]
+  python -m services.voice.main [--no-validate] [--listen]
 
 --listen: skip wake word detection; pipeline always active.
 """
@@ -43,15 +43,15 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.piper.tts import PiperTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
+from .agent import AgentProcessor
 from .clients import OpenWakeWordDetector, VoiceDependencyError
-from .core import VoiceConfig, load_system_prompt
+from .core import VoiceConfig
+from .skills.weather import WeatherSkill
 from .wake import WakeWordProcessor
 
 
@@ -186,6 +186,17 @@ async def validate_startup(config: VoiceConfig) -> None:
 
     if not config.tts_model_path.exists():
         raise VoiceDependencyError(f"TTS model missing: {config.tts_model_path}")
+
+    if not config.embed_model_path.exists():
+        logger.warning(
+            "startup: embed model missing at {} — router will use heuristic fallback",
+            config.embed_model_path,
+        )
+    if not config.router_exemplars_path.exists():
+        logger.warning(
+            "startup: exemplars file missing at {} — router will run without negative corpus",
+            config.router_exemplars_path,
+        )
 
     try:
         import sounddevice as sd
@@ -386,12 +397,38 @@ def _select_audio_devices(
 
 
 # ---------------------------------------------------------------------------
+# Router exemplars
+# ---------------------------------------------------------------------------
+
+def _load_none_exemplars(path: Path) -> list[str]:
+    """Load negative ('none') exemplars from JSONL.
+
+    Expected line format: {"text": "...", "label": "none"}.
+    """
+    if not path.exists():
+        logger.warning("router: exemplars file not found at {} (continuing)", path)
+        return []
+
+    none_exemplars: list[str] = []
+    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+            if row.get("label") == "none" and isinstance(row.get("text"), str):
+                text = row["text"].strip()
+                if text:
+                    none_exemplars.append(text)
+        except Exception:
+            logger.debug("router: skipping malformed exemplar at {}:{}", path, lineno)
+    return none_exemplars
+
+
+# ---------------------------------------------------------------------------
 # Pipeline builder
 # ---------------------------------------------------------------------------
 
 def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | None]:
-    system_prompt = load_system_prompt(config.prompt_path)
-
     # --- Transport -----------------------------------------------------------
     input_device_index, output_device_index = _select_audio_devices(
         sample_rate=config.sample_rate,
@@ -436,18 +473,15 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
         ),
     )
 
-    # --- LLM context & aggregators -------------------------------------------
-    context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
-    aggregators = LLMContextAggregatorPair(context)
-
-    # --- LLM -----------------------------------------------------------------
-    llm = OpenAILLMService(
-        api_key="not-needed",
-        base_url=f"{config.llm_base_url}/v1",
-        settings=OpenAILLMService.Settings(
-            model=config.llm_model,
-            temperature=0.2,
-        ),
+    # --- AgentProcessor ------------------------------------------------------
+    none_exemplars = _load_none_exemplars(config.router_exemplars_path)
+    agent = AgentProcessor(
+        config=config,
+        skills=[WeatherSkill()],
+        embed_model_path=config.embed_model_path,
+        none_exemplars=none_exemplars,
+        threshold=config.router_threshold,
+        min_gap=config.router_min_gap,
     )
 
     # --- TTS -----------------------------------------------------------------
@@ -478,23 +512,17 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
     # --- Wake reset relay ----------------------------------------------------
     wake_reset_relay = WakeResetRelay()
 
-    # --- Context trimmer (bounds LLMContext growth across turns) --------------
-    context_trimmer = ContextTrimmer(context=context, history_turns=config.history_turns)
-
     # --- Pipeline ------------------------------------------------------------
     pipeline = Pipeline([
         transport.input(),
         *wake_stages,
         vad,
         stt,
-        aggregators.user(),
-        llm,
+        agent,
         tts,
         wake_reset_relay,
         latency_observer,
         transport.output(),
-        aggregators.assistant(),
-        context_trimmer,
     ])
 
     return pipeline, wake
