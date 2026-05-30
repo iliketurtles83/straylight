@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_MODEL = Path("/home/jack/Projects/straylight/models/tts/en_US-amy-medium.onnx")
+DEFAULT_MODEL = Path("/path/to/straylight/models/tts/en_US-amy-medium.onnx")
 DEFAULT_TEXT = "Ghost in the Shell and Akira are awesome."
 
 

@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
@@ -17,15 +17,27 @@ from services.voice.skills.weather import WeatherSkill
 
 
 class VoiceCoreTests(unittest.TestCase):
-    def test_prompt_loader_relabels_hearth_to_cass(self) -> None:
+    def test_prompt_loader_renders_assistant_name_placeholder(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             prompt_path = Path(temp_dir) / "prompt.txt"
-            prompt_path.write_text("You are Hearth. Speak plainly.", encoding="utf-8")
+            prompt_path.write_text(
+                "You are {assistant_name}. Speak plainly.",
+                encoding="utf-8",
+            )
 
-            prompt = load_system_prompt(prompt_path)
+            prompt = load_system_prompt(prompt_path, "Nyx")
 
-        self.assertIn("Cass", prompt)
-        self.assertNotIn("Hearth", prompt)
+        self.assertIn("Nyx", prompt)
+        self.assertNotIn("{assistant_name}", prompt)
+
+    def test_prompt_loader_leaves_non_template_words_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prompt_path = Path(temp_dir) / "prompt.txt"
+            prompt_path.write_text("Hearth protocol active.", encoding="utf-8")
+
+            prompt = load_system_prompt(prompt_path, "Cass")
+
+        self.assertEqual(prompt, "Hearth protocol active.")
 
     def test_conversation_window_keeps_history_until_agent_trims(self) -> None:
         window = ConversationWindow(system_prompt="system")
@@ -250,6 +262,40 @@ class WakeWordProcessorTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_startup_validation_requires_ack_player_binary(self) -> None:
+        from services.voice.main import validate_startup
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            wake_dir = root / "wake"
+            wake_dir.mkdir(parents=True, exist_ok=True)
+
+            (wake_dir / "computer_v2.onnx").write_bytes(b"0")
+            (wake_dir / "melspectrogram.onnx").write_bytes(b"0")
+            (wake_dir / "embedding_model.onnx").write_bytes(b"0")
+
+            tts_model = root / "voice.onnx"
+            tts_model.write_bytes(b"0")
+            ack_file = root / "ack.mp3"
+            ack_file.write_bytes(b"0")
+
+            config = VoiceConfig(
+                wake_model_dir=wake_dir,
+                tts_model_path=tts_model,
+                ack_sound_path=ack_file,
+                ack_player_bin="missing-ack-player",
+                llm_base_url="http://llama.test",
+            )
+
+            with patch("services.voice.main.shutil.which", return_value=None), patch(
+                "services.voice.main._validate_llama_server",
+                new=AsyncMock(return_value=None),
+            ), patch("sounddevice.query_devices", return_value=[]), patch(
+                "sounddevice.check_input_settings", return_value=None
+            ), patch("sounddevice.check_output_settings", return_value=None):
+                with self.assertRaisesRegex(VoiceDependencyError, "Ack player binary"):
+                    asyncio.run(validate_startup(config))
+
     def test_to_mono_pcm16_uses_first_channel(self) -> None:
         from pipecat.frames.frames import InputAudioRawFrame
         from services.voice.wake import WakeWordProcessor
@@ -430,13 +476,14 @@ class AgentRouterTests(unittest.TestCase):
             embed_model_path=Path("/tmp/not-there.gguf"),
         )
 
-        async def run() -> tuple[str | None, float, int]:
+        async def run() -> tuple[str | None, float, int, str]:
             return await agent._classify("please route-me now")
 
-        label, score, classifier_ms = asyncio.run(run())
+        label, score, classifier_ms, source = asyncio.run(run())
         self.assertEqual(label, "dummy")
-        self.assertEqual(score, 1.0)
+        self.assertEqual(score, -1.0)
         self.assertEqual(classifier_ms, 0)
+        self.assertEqual(source, "heuristic")
 
     def test_agent_trims_conversation_to_token_budget(self) -> None:
         agent = AgentProcessor(
@@ -512,8 +559,12 @@ class AgentDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag[0].path, "slow")
         self.assertEqual(diag[0].provider, "local")
         self.assertEqual(diag[0].output_tokens, 7)
+        self.assertEqual(diag[0].classifier_source, "disabled")
+        self.assertEqual(diag[0].classifier_confidence, -1.0)
         self.assertGreaterEqual(diag[0].agent_ms, 0)
         self.assertEqual(intents[0].path, "slow")
+        self.assertEqual(intents[0].classifier_source, "disabled")
+        self.assertEqual(intents[0].confidence, -1.0)
 
     def test_skill_failure_falls_back_to_spoken_message(self) -> None:
         from services.voice.skills import SkillExecutionError
@@ -555,6 +606,35 @@ class AgentDiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(diag), 1)
         self.assertEqual(diag[0].path, "fast")
         self.assertEqual(diag[0].skill_label, "weather")
+
+    def test_cancelled_turn_publishes_idle_cleanup(self) -> None:
+        from shared.straylight_shared.events import SpeakingEvent, StateEvent
+
+        agent, captured = self._make_agent()
+
+        async def slow_stream(_messages):
+            yield "hello"
+            await asyncio.sleep(1.0)
+
+        agent._llm_stream = slow_stream  # type: ignore[method-assign]
+
+        async def run() -> None:
+            task = asyncio.create_task(agent._process_turn("interrupt me"))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run())
+
+        states = [e.state for e in captured if isinstance(e, StateEvent)]
+        self.assertIn("thinking", states)
+        self.assertIn("speaking", states)
+        self.assertEqual(states[-1], "idle")
+
+        speaking = [e.state for e in captured if isinstance(e, SpeakingEvent)]
+        self.assertIn("start", speaking)
+        self.assertEqual(speaking[-1], "stop")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ States:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ class WakeWordProcessor(FrameProcessor):
         self,
         detector: OpenWakeWordDetector,
         ack_path: Path,
+        ack_player_bin: str = "ffplay",
         vad_threshold: float = 0.3,
         awake_timeout_seconds: float = 30.0,
         **kwargs,
@@ -71,9 +73,11 @@ class WakeWordProcessor(FrameProcessor):
         super().__init__(**kwargs)
         self._detector = detector
         self._ack_path = ack_path
+        self._ack_player_bin = ack_player_bin
         self._vad_threshold = vad_threshold
         self._awake_timeout_seconds = awake_timeout_seconds
         self._awake_timeout_task: asyncio.Task | None = None
+        self._ack_task: asyncio.Task | None = None
         self._state = _State.sleeping
         self._marker = _LatencyMarker()
         # RMS energy gate: 512-sample windows at 16kHz (32ms) — same granularity
@@ -172,9 +176,10 @@ class WakeWordProcessor(FrameProcessor):
                 await self.push_frame(frame, direction)
 
         elif isinstance(frame, BotStoppedSpeakingFrame):
-            if self._awake_timeout_task is not None:
-                self._awake_timeout_task.cancel()
-                self._awake_timeout_task = None
+            self._cancel_task(self._awake_timeout_task)
+            self._awake_timeout_task = None
+            self._cancel_task(self._ack_task)
+            self._ack_task = None
             if self._state is _State.awake:
                 logger.debug("wake: bot done speaking → back to sleeping")
             self._state = _State.sleeping
@@ -246,9 +251,19 @@ class WakeWordProcessor(FrameProcessor):
             # Stuck-awake guard: if BotStoppedSpeakingFrame never arrives (LLM/TTS
             # failure, interruption without clean shutdown), force-reset to sleeping
             # after a timeout rather than passing all mic audio downstream indefinitely.
-            self._awake_timeout_task = asyncio.ensure_future(self._awake_timeout())
+            self._cancel_task(self._awake_timeout_task)
+            self._awake_timeout_task = asyncio.create_task(
+                self._awake_timeout(),
+                name="wake-awake-timeout",
+            )
+            self._awake_timeout_task.add_done_callback(self._on_awake_timeout_done)
             # Play ack concurrently; don't block the pipeline.
-            asyncio.ensure_future(self._play_ack())
+            self._cancel_task(self._ack_task)
+            self._ack_task = asyncio.create_task(
+                self._play_ack(),
+                name="wake-ack-playback",
+            )
+            self._ack_task.add_done_callback(self._on_ack_task_done)
             return
 
     async def _awake_timeout(self) -> None:
@@ -267,17 +282,59 @@ class WakeWordProcessor(FrameProcessor):
             self._oww_buffer = b""
             self._flush_remaining = 0
             self._detector.reset()
-        self._awake_timeout_task = None
 
     async def _play_ack(self) -> None:
         try:
-            await asyncio.to_thread(
-                lambda: subprocess.run(
-                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "error", str(self._ack_path)],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    self._ack_player_bin,
+                    "-nodisp",
+                    "-autoexit",
+                    "-loglevel",
+                    "error",
+                    str(self._ack_path),
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or "").strip().splitlines()
+                suffix = f" stderr={detail[-1][:200]!r}" if detail else ""
+                logger.warning(
+                    "wake: ack playback failed: binary={} exit_code={} file={}{}",
+                    self._ack_player_bin,
+                    result.returncode,
+                    self._ack_path,
+                    suffix,
                 )
+        except FileNotFoundError:
+            logger.error(
+                "wake: ack playback binary missing at runtime: {}",
+                self._ack_player_bin,
             )
         except Exception as exc:
-            logger.warning(f"wake: ack playback failed: {exc}")
+            logger.warning("wake: ack playback failed: {}", exc)
+
+    @staticmethod
+    def _cancel_task(task: asyncio.Task | None) -> None:
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _on_awake_timeout_done(self, task: asyncio.Task) -> None:
+        if task is self._awake_timeout_task:
+            self._awake_timeout_task = None
+        with contextlib.suppress(asyncio.CancelledError):
+            exc = task.exception()
+            if exc is not None:
+                logger.warning("wake: awake-timeout task failed: {}", exc)
+
+    def _on_ack_task_done(self, task: asyncio.Task) -> None:
+        if task is self._ack_task:
+            self._ack_task = None
+        with contextlib.suppress(asyncio.CancelledError):
+            exc = task.exception()
+            if exc is not None:
+                logger.warning("wake: ack task failed: {}", exc)

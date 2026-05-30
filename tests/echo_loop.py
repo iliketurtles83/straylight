@@ -78,7 +78,7 @@ class EchoProcessor(FrameProcessor):
             if text:
                 logger.info("echo: heard = {!r}", text)
                 # Fire ack concurrently — don't stall the frame push.
-                asyncio.ensure_future(self._play_ack())
+                asyncio.create_task(self._play_ack(), name="echo-ack-playback")
                 await self.push_frame(TextFrame(text=text), direction)
         else:
             await self.push_frame(frame, direction)

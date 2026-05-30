@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import shutil
 import time
 from pathlib import Path
 
@@ -149,6 +150,7 @@ async def validate_startup(config: VoiceConfig) -> None:
 
         if not config.ack_sound_path.exists():
             raise VoiceDependencyError(f"Ack sound missing: {config.ack_sound_path}")
+        _validate_ack_player_binary(config)
 
     if not config.tts_model_path.exists():
         raise VoiceDependencyError(f"TTS model missing: {config.tts_model_path}")
@@ -184,6 +186,17 @@ async def validate_startup(config: VoiceConfig) -> None:
         await _validate_llama_server(config, client)
 
     logger.info("startup validation passed")
+
+
+def _validate_ack_player_binary(config: VoiceConfig) -> None:
+    """Ensure the configured ack playback binary is available and executable."""
+
+    resolved = shutil.which(config.ack_player_bin)
+    if resolved is None:
+        raise VoiceDependencyError(
+            "Ack player binary not found: "
+            f"{config.ack_player_bin}. Install ffplay or set CASS_ACK_PLAYER_BIN."
+        )
 
 
 async def _validate_llama_server(config: VoiceConfig, client: httpx.AsyncClient) -> None:
@@ -450,7 +463,9 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
             threshold=config.wake_threshold,
         )
         wake: WakeWordProcessor | None = WakeWordProcessor(
-            detector=detector, ack_path=config.ack_sound_path
+            detector=detector,
+            ack_path=config.ack_sound_path,
+            ack_player_bin=config.ack_player_bin,
         )
         wake_stages: list = [wake]
     else:

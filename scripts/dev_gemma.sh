@@ -50,7 +50,7 @@ done
 # --------------------------------------------------------------------------
 # Configuration — all overridable via .env
 # --------------------------------------------------------------------------
-: "${LLAMA_SERVER:=/home/jack/Projects/llama.cpp/build/bin/llama-server}"
+: "${LLAMA_SERVER:=llama-server}"
 
 # Network
 : "${LLAMA_PORT:=8080}"

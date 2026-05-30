@@ -27,6 +27,7 @@ import math
 import time
 import uuid
 from pathlib import Path
+from typing import Literal
 from typing import AsyncIterator
 
 import httpx
@@ -98,6 +99,9 @@ class AgentProcessor(FrameProcessor):
 
     DEFAULT_THRESHOLD: float = 0.80
     DEFAULT_MIN_GAP: float = 0.05
+    CLASSIFIER_SOURCE_EMBEDDING: Literal["embedding"] = "embedding"
+    CLASSIFIER_SOURCE_HEURISTIC: Literal["heuristic"] = "heuristic"
+    CLASSIFIER_SOURCE_DISABLED: Literal["disabled"] = "disabled"
 
     def __init__(
         self,
@@ -122,7 +126,7 @@ class AgentProcessor(FrameProcessor):
         self._session_id = session_id or uuid.uuid4().hex[:12]
 
         # Conversation context (AgentProcessor owns this; no LLMContextAggregatorPair)
-        system_prompt = load_system_prompt(config.prompt_path)
+        system_prompt = load_system_prompt(config.prompt_path, config.assistant_name)
         self._conversation = ConversationWindow(system_prompt=system_prompt)
         self._token_cache: dict[str, int] = {}
 
@@ -150,7 +154,11 @@ class AgentProcessor(FrameProcessor):
             await self._cancel_current()
             text = frame.text.strip()
             if text:
-                self._current_task = asyncio.create_task(self._process_turn(text))
+                self._current_task = asyncio.create_task(
+                    self._process_turn(text),
+                    name=f"agent-turn-{self._session_id}",
+                )
+                self._current_task.add_done_callback(self._on_current_task_done)
             # Do not push TranscriptionFrame further; AgentProcessor is the consumer.
             return
 
@@ -168,11 +176,30 @@ class AgentProcessor(FrameProcessor):
     # ------------------------------------------------------------------
 
     async def _cancel_current(self) -> None:
-        if self._current_task and not self._current_task.done():
-            self._current_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._current_task
-        self._current_task = None
+        task = self._current_task
+        if task is None:
+            return
+
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.debug("agent: cancelled task ended with error: {}", exc)
+
+        if self._current_task is task:
+            self._current_task = None
+
+    def _on_current_task_done(self, task: asyncio.Task) -> None:
+        if task is self._current_task:
+            self._current_task = None
+
+        with contextlib.suppress(asyncio.CancelledError):
+            exc = task.exception()
+            if exc is not None:
+                logger.warning("agent: turn task failed: {}", exc)
 
     # ------------------------------------------------------------------
     # Lazy initialisation — embed model + exemplar index
@@ -259,25 +286,40 @@ class AgentProcessor(FrameProcessor):
     # Classification
     # ------------------------------------------------------------------
 
-    async def _classify(self, text: str) -> tuple[str | None, float, int]:
+    async def _classify(
+        self, text: str
+    ) -> tuple[str | None, float, int, Literal["embedding", "heuristic", "disabled"]]:
         """Classify a transcript against registered skill exemplars.
 
         Returns:
-            (skill_label, best_score, classifier_ms)
+            (skill_label, score, classifier_ms, classifier_source)
             skill_label is None when routing to the slow path.
         """
         if self._llama is None or not self._exemplar_index:
             heuristic_skill = self._heuristic_route(text)
             if heuristic_skill is not None:
-                return heuristic_skill, 1.0, 0
-            return None, 0.0, 0
+                return (
+                    heuristic_skill,
+                    -1.0,
+                    0,
+                    self.CLASSIFIER_SOURCE_HEURISTIC,
+                )
+            return None, -1.0, 0, self.CLASSIFIER_SOURCE_DISABLED
 
         t0 = time.perf_counter()
         try:
             emb = await asyncio.to_thread(self._embed_sync, text)
         except Exception as exc:
             logger.warning("agent: embed failed ({}); slow path", exc)
-            return None, 0.0, 0
+            heuristic_skill = self._heuristic_route(text)
+            if heuristic_skill is not None:
+                return (
+                    heuristic_skill,
+                    -1.0,
+                    0,
+                    self.CLASSIFIER_SOURCE_HEURISTIC,
+                )
+            return None, -1.0, 0, self.CLASSIFIER_SOURCE_DISABLED
         classifier_ms = round((time.perf_counter() - t0) * 1000)
 
         scored = sorted(
@@ -306,9 +348,14 @@ class AgentProcessor(FrameProcessor):
         ):
             skill = next((s for s in self._skills if s.name == best_label), None)
             if skill is not None:
-                return best_label, best_score, classifier_ms
+                return (
+                    best_label,
+                    best_score,
+                    classifier_ms,
+                    self.CLASSIFIER_SOURCE_EMBEDDING,
+                )
 
-        return None, best_score, classifier_ms
+        return None, best_score, classifier_ms, self.CLASSIFIER_SOURCE_EMBEDDING
 
     def _heuristic_route(self, text: str) -> str | None:
         """Fallback router used when embed classification is unavailable."""
@@ -329,7 +376,9 @@ class AgentProcessor(FrameProcessor):
         t_turn_start = time.perf_counter()
 
         # --- Classify ---------------------------------------------------
-        skill_label, score, classifier_ms = await self._classify(transcript)
+        skill_label, score, classifier_ms, classifier_source = await self._classify(
+            transcript
+        )
         path = "fast" if skill_label is not None else "slow"
 
         # --- Publish pre-LLM events -----------------------------------
@@ -341,6 +390,7 @@ class AgentProcessor(FrameProcessor):
                 path=path,
                 skill_label=skill_label,
                 confidence=score,
+                classifier_source=classifier_source,
                 classifier_ms=classifier_ms,
                 session_id=self._session_id,
             )
@@ -350,6 +400,7 @@ class AgentProcessor(FrameProcessor):
         # --- Generate and stream response ----------------------------
         full_response_parts: list[str] = []
         t_first_chunk: float | None = None
+        speaking_started = False
 
         try:
             async with self._llm_lock:
@@ -365,16 +416,27 @@ class AgentProcessor(FrameProcessor):
                         await publisher.publish(
                             StateEvent(state="speaking", session_id=self._session_id)
                         )
+                        speaking_started = True
                     full_response_parts.append(chunk)
                     await self.push_frame(
                         TextFrame(text=chunk), FrameDirection.DOWNSTREAM
                     )
 
         except asyncio.CancelledError:
+            if speaking_started:
+                await publisher.publish(
+                    SpeakingEvent(state="stop", text="", session_id=self._session_id)
+                )
+            await publisher.publish(StateEvent(state="idle", session_id=self._session_id))
             logger.debug("agent: turn cancelled (barge-in)")
             raise
 
         except Exception as exc:
+            if speaking_started:
+                await publisher.publish(
+                    SpeakingEvent(state="stop", text="", session_id=self._session_id)
+                )
+            await publisher.publish(StateEvent(state="idle", session_id=self._session_id))
             logger.error("agent: unhandled error in turn: {}", exc)
             raise
 
@@ -420,6 +482,8 @@ class AgentProcessor(FrameProcessor):
                 context_tokens=context_tokens,
                 output_tokens=output_tokens,
                 tokens_per_sec=tokens_per_sec,
+                classifier_confidence=score,
+                classifier_source=classifier_source,
                 classifier_ms=classifier_ms,
                 agent_ms=agent_ms,
                 ttfb_ms=ttfb_ms,
@@ -434,6 +498,8 @@ class AgentProcessor(FrameProcessor):
                     "skill_label": skill_label,
                     "model": self._config.llm_model,
                     "provider": "local",
+                    "classifier_source": classifier_source,
+                    "classifier_confidence": score,
                     "classifier_ms": classifier_ms,
                     "agent_ms": agent_ms,
                     "ttfb_ms": ttfb_ms,

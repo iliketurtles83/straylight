@@ -278,10 +278,10 @@ What still needs to be done for the corpus/accuracy gate:
 - [x] UI-facing diagnostics metadata emitted per turn: model/provider, context tokens, output tokens when available, tokens/sec when available, route/path, latency breakdown *(via `TurnDiagnosticsEvent`)*
 - [ ] Fast path adds < 100ms over Phase 1 baseline, proven by a dated measurement run *(embed call is wrapped in `asyncio.to_thread`; `classifier_ms` logged per turn for ongoing validation)*
 - [x] `history_tokens` cap enforced by token budget, not turn count; `/tokenize` availability checked at startup; fallback estimate and caching defined
-- [ ] Diagnostics distinguish `classifier_source="embedding"` from `classifier_source="heuristic"`; heuristic route confidence is not reported as perfect embedding confidence
-- [ ] Prompt loading uses explicit assistant-name templating instead of global Hearth/Cass string replacement
-- [ ] Wake ack playback dependency is validated or replaced with an in-process fallback; ack playback failures are visible in logs
-- [ ] Interrupted/cancelled turns publish a clean return-to-idle state and are marked as interrupted if diagnostics are emitted
+- [x] Diagnostics distinguish `classifier_source="embedding"` from `classifier_source="heuristic"`; heuristic route confidence is not reported as perfect embedding confidence
+- [x] Prompt loading uses explicit assistant-name templating instead of global Hearth/Cass string replacement
+- [x] Wake ack playback dependency is validated or replaced with an in-process fallback; ack playback failures are visible in logs
+- [x] Interrupted/cancelled turns publish a clean return-to-idle state and are marked as interrupted if diagnostics are emitted
 - [x] State lifecycle published consistently enough for the gateway and memory worker to infer what Cass is doing without private pipeline state
 
 ---

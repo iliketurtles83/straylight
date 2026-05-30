@@ -36,6 +36,7 @@ class VoiceConfig:
     llm_model: str = "cass"
     tts_model_path: Path = _BASE_DIR / "models" / "tts" / "en_US-amy-medium.onnx"
     ack_sound_path: Path = _BASE_DIR / "models" / "tts" / "ack.mp3"
+    ack_player_bin: str = "ffplay"
     input_device_name: str | None = None
     output_device_name: str | None = None
     history_tokens: int = DEFAULT_HISTORY_TOKENS
@@ -80,6 +81,7 @@ class VoiceConfig:
             llm_model=os.getenv("CASS_LLM_MODEL", "cass").strip() or "cass",
             tts_model_path=tts_model_path,
             ack_sound_path=ack_sound_path,
+            ack_player_bin=os.getenv("CASS_ACK_PLAYER_BIN", "ffplay").strip() or "ffplay",
             input_device_name=_env_optional_str("CASS_INPUT_DEVICE_NAME"),
             output_device_name=_env_optional_str("CASS_OUTPUT_DEVICE_NAME"),
             history_tokens=_env_int("CASS_HISTORY_TOKENS", DEFAULT_HISTORY_TOKENS),
@@ -153,10 +155,9 @@ def _env_optional_str(name: str) -> str | None:
     return raw or None
 
 
-def load_system_prompt(prompt_path: Path) -> str:
+def load_system_prompt(prompt_path: Path, assistant_name: str = "Cass") -> str:
     prompt = prompt_path.read_text(encoding="utf-8").strip()
-    prompt = prompt.replace("Hearth", "Cass")
-    prompt = prompt.replace("hearth", "cass")
+    prompt = prompt.replace("{assistant_name}", assistant_name)
     return prompt.strip()
 
 
