@@ -93,7 +93,31 @@ class StateEvent:
     Sleep consolidation worker uses this to decide when to run.
     """
 
-    state: Literal["idle", "listening", "thinking", "speaking"]
+    state: Literal["idle", "listening", "thinking", "tool_calling", "speaking"]
     session_id: str
     timestamp_ms: int = field(default_factory=_now_ms)
     channel: str = "cass:state"
+
+
+@dataclass
+class TurnDiagnosticsEvent:
+    """End-of-turn UI metadata. Drives the diagnostics panel in Phase 4.
+
+    Populated by AgentProcessor after the response stream finishes (or after
+    cancellation). All latency fields are integer milliseconds; token counts
+    are -1 when the underlying source was unavailable.
+    """
+
+    session_id: str
+    path: Literal["fast", "slow"]
+    skill_label: str | None
+    model: str
+    provider: Literal["local", "cloud"]
+    context_tokens: int
+    output_tokens: int
+    tokens_per_sec: float
+    classifier_ms: int
+    agent_ms: int
+    ttfb_ms: int
+    timestamp_ms: int = field(default_factory=_now_ms)
+    channel: str = "cass:diagnostics"

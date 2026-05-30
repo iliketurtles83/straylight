@@ -2,8 +2,10 @@ models
 imported_code
 .env
 __pycache__/
+archive/
 *.pyc
 .venv/
 *.gguf
 *.onnx
 *.mp3
+.aider*

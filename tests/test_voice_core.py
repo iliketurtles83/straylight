@@ -456,5 +456,99 @@ class AgentRouterTests(unittest.TestCase):
         self.assertEqual(classifier_ms, 0)
 
 
+class AgentDiagnosticsTests(unittest.TestCase):
+    """End-to-end turn coverage: events + skill fallback."""
+
+    def _make_agent(self, skill: Skill | None = None) -> tuple[AgentProcessor, list]:
+        from shared.straylight_shared import events as ev
+        from services.voice import publisher
+
+        captured: list = []
+
+        async def fake_publish(event):
+            captured.append(event)
+
+        publisher.publish = fake_publish  # type: ignore[assignment]
+
+        agent = AgentProcessor(
+            config=VoiceConfig(),
+            skills=[skill] if skill else [],
+            embed_model_path=Path("/tmp/not-there.gguf"),
+            session_id="t",
+        )
+        # Stub LLM helpers — no network.
+        async def _stream(messages):
+            for c in ("hello ", "there"):
+                yield c
+        async def _single(messages):
+            return "weather formatted reply"
+        async def _count(text=None):
+            return 7
+        agent._llm_stream = _stream  # type: ignore[method-assign]
+        agent._llm_single_shot = _single  # type: ignore[method-assign]
+        agent._count_tokens = lambda: _count()  # type: ignore[assignment]
+        agent._count_tokens_for = lambda text: _count(text)  # type: ignore[assignment]
+        return agent, captured
+
+    def test_turn_publishes_diagnostics_event_on_slow_path(self) -> None:
+        from shared.straylight_shared.events import TurnDiagnosticsEvent, IntentEvent
+
+        agent, captured = self._make_agent()
+
+        async def run() -> None:
+            await agent._process_turn("hello there")
+
+        asyncio.run(run())
+        diag = [e for e in captured if isinstance(e, TurnDiagnosticsEvent)]
+        intents = [e for e in captured if isinstance(e, IntentEvent)]
+        self.assertEqual(len(diag), 1)
+        self.assertEqual(diag[0].path, "slow")
+        self.assertEqual(diag[0].provider, "local")
+        self.assertEqual(diag[0].output_tokens, 7)
+        self.assertGreaterEqual(diag[0].agent_ms, 0)
+        self.assertEqual(intents[0].path, "slow")
+
+    def test_skill_failure_falls_back_to_spoken_message(self) -> None:
+        from services.voice.skills import SkillExecutionError
+        from shared.straylight_shared.events import TurnDiagnosticsEvent
+
+        class BrokenSkill(Skill):
+            @property
+            def name(self) -> str:
+                return "weather"
+
+            @property
+            def exemplars(self) -> list[str]:
+                return []
+
+            def can_handle(self, transcript: str) -> bool:
+                return "weather" in transcript
+
+            def entities(self, transcript: str) -> dict:
+                return {"location": "London"}
+
+            async def execute(self, entities: dict) -> str:
+                raise SkillExecutionError("tool down")
+
+        agent, captured = self._make_agent(BrokenSkill())
+        pushed: list = []
+
+        async def capture(frame, direction):
+            pushed.append(frame)
+        agent.push_frame = capture  # type: ignore[method-assign]
+
+        async def run() -> None:
+            await agent._process_turn("weather in london")
+
+        asyncio.run(run())
+        texts = [getattr(f, "text", "") for f in pushed]
+        joined = " ".join(texts)
+        self.assertTrue(joined.strip(), "expected a spoken fallback")
+        diag = [e for e in captured if isinstance(e, TurnDiagnosticsEvent)]
+        self.assertEqual(len(diag), 1)
+        self.assertEqual(diag[0].path, "fast")
+        self.assertEqual(diag[0].skill_label, "weather")
+
+
 if __name__ == "__main__":
     unittest.main()

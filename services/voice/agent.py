@@ -46,6 +46,7 @@ from shared.straylight_shared.events import (
     SpeakingEvent,
     StateEvent,
     TranscriptEvent,
+    TurnDiagnosticsEvent,
 )
 
 from . import publisher
@@ -350,11 +351,13 @@ class AgentProcessor(FrameProcessor):
 
         # --- Generate and stream response ----------------------------
         full_response_parts: list[str] = []
+        t_first_chunk: float | None = None
 
         try:
             async with self._llm_lock:
                 async for chunk in self._generate_response(transcript, path, skill_label):
                     if not full_response_parts:
+                        t_first_chunk = time.perf_counter()
                         # First chunk: signal start of speaking
                         await publisher.publish(
                             SpeakingEvent(
@@ -383,18 +386,45 @@ class AgentProcessor(FrameProcessor):
         if full_response:
             self._conversation.add_turn(transcript, full_response)
 
-        # --- Token count (log only; trimming via history_turns) --------
-        token_count = await self._count_tokens()
+        # --- Token counts (context + output) ---------------------------
+        context_tokens = await self._count_tokens()
+        output_tokens = await self._count_tokens_for(full_response) if full_response else 0
+
+        # --- Latency math ---------------------------------------------
+        t_end = time.perf_counter()
+        agent_ms = round((t_end - t_turn_start) * 1000)
+        ttfb_ms = (
+            round((t_first_chunk - t_turn_start) * 1000) if t_first_chunk else agent_ms
+        )
+        generation_s = (t_end - t_first_chunk) if t_first_chunk else 0.0
+        tokens_per_sec = (
+            round(output_tokens / generation_s, 2)
+            if output_tokens > 0 and generation_s > 0
+            else 0.0
+        )
 
         # --- Publish post-turn events ----------------------------------
-        agent_ms = round((time.perf_counter() - t_turn_start) * 1000)
-
         await publisher.publish(
             SpeakingEvent(
                 state="stop", text=full_response, session_id=self._session_id
             )
         )
         await publisher.publish(StateEvent(state="idle", session_id=self._session_id))
+        await publisher.publish(
+            TurnDiagnosticsEvent(
+                session_id=self._session_id,
+                path=path,  # type: ignore[arg-type]
+                skill_label=skill_label,
+                model=self._config.llm_model,
+                provider="local",
+                context_tokens=context_tokens,
+                output_tokens=output_tokens,
+                tokens_per_sec=tokens_per_sec,
+                classifier_ms=classifier_ms,
+                agent_ms=agent_ms,
+                ttfb_ms=ttfb_ms,
+            )
+        )
 
         logger.info(
             json.dumps(
@@ -402,9 +432,14 @@ class AgentProcessor(FrameProcessor):
                     "event": "agent_turn",
                     "path": path,
                     "skill_label": skill_label,
+                    "model": self._config.llm_model,
+                    "provider": "local",
                     "classifier_ms": classifier_ms,
                     "agent_ms": agent_ms,
-                    "history_tokens": token_count,
+                    "ttfb_ms": ttfb_ms,
+                    "context_tokens": context_tokens,
+                    "output_tokens": output_tokens,
+                    "tokens_per_sec": tokens_per_sec,
                 }
             )
         )
@@ -517,6 +552,12 @@ class AgentProcessor(FrameProcessor):
         """
         messages = self._conversation.build_messages("")
         text = " ".join(m.get("content", "") for m in messages if m.get("content"))
+        return await self._count_tokens_for(text)
+
+    async def _count_tokens_for(self, text: str) -> int:
+        """Tokenize arbitrary text via llama.cpp /tokenize. -1 on failure."""
+        if not text:
+            return 0
         url = f"{self._config.llm_base_url}/tokenize"
         try:
             async with httpx.AsyncClient() as client:
