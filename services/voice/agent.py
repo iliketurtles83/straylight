@@ -123,10 +123,8 @@ class AgentProcessor(FrameProcessor):
 
         # Conversation context (AgentProcessor owns this; no LLMContextAggregatorPair)
         system_prompt = load_system_prompt(config.prompt_path)
-        self._conversation = ConversationWindow(
-            system_prompt=system_prompt,
-            history_turns=config.history_turns,
-        )
+        self._conversation = ConversationWindow(system_prompt=system_prompt)
+        self._token_cache: dict[str, int] = {}
 
         # Lazy-initialised embed state
         self._llama: object | None = None           # llama_cpp.Llama | None
@@ -385,9 +383,11 @@ class AgentProcessor(FrameProcessor):
         # --- Update conversation history --------------------------------
         if full_response:
             self._conversation.add_turn(transcript, full_response)
+            context_tokens = await self._trim_conversation_to_token_budget()
+        else:
+            context_tokens = await self._count_context_tokens()
 
         # --- Token counts (context + output) ---------------------------
-        context_tokens = await self._count_tokens()
         output_tokens = await self._count_tokens_for(full_response) if full_response else 0
 
         # --- Latency math ---------------------------------------------
@@ -545,19 +545,43 @@ class AgentProcessor(FrameProcessor):
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"].strip()
 
-    async def _count_tokens(self) -> int:
-        """Count tokens in current conversation history via llama.cpp /tokenize.
+    async def _trim_conversation_to_token_budget(self) -> int:
+        """Drop oldest turn pairs until the retained context fits history_tokens."""
+        budget = max(1, int(self._config.history_tokens))
+        context_tokens = await self._count_context_tokens()
+        trimmed_pairs = 0
 
-        Returns -1 on failure (server unavailable or endpoint missing).
-        """
-        messages = self._conversation.build_messages("")
-        text = " ".join(m.get("content", "") for m in messages if m.get("content"))
+        while context_tokens > budget and self._conversation.drop_oldest_turn_pair():
+            trimmed_pairs += 1
+            context_tokens = await self._count_context_tokens()
+
+        if trimmed_pairs:
+            logger.debug(
+                "context: trimmed {} oldest pair(s) to {} tokens (budget={})",
+                trimmed_pairs,
+                context_tokens,
+                budget,
+            )
+
+        return context_tokens
+
+    async def _count_tokens(self) -> int:
+        """Backward-compatible wrapper for tests and diagnostics."""
+        return await self._count_context_tokens()
+
+    async def _count_context_tokens(self) -> int:
+        """Count tokens in retained conversation history."""
+        text = self._messages_to_token_text(self._conversation.build_messages(""))
         return await self._count_tokens_for(text)
 
     async def _count_tokens_for(self, text: str) -> int:
-        """Tokenize arbitrary text via llama.cpp /tokenize. -1 on failure."""
+        """Tokenize arbitrary text via llama.cpp /tokenize, with fallback estimate."""
         if not text:
             return 0
+        cached = self._token_cache.get(text)
+        if cached is not None:
+            return cached
+
         url = f"{self._config.llm_base_url}/tokenize"
         try:
             async with httpx.AsyncClient() as client:
@@ -565,6 +589,32 @@ class AgentProcessor(FrameProcessor):
                     url, json={"content": text}, timeout=5.0
                 )
                 resp.raise_for_status()
-                return len(resp.json().get("tokens", []))
-        except Exception:
-            return -1
+                count = len(resp.json().get("tokens", []))
+                self._token_cache[text] = count
+                return count
+        except Exception as exc:
+            estimate = self._estimate_token_count(text)
+            logger.debug(
+                "tokenize: falling back to estimate={} for {} chars ({})",
+                estimate,
+                len(text),
+                exc,
+            )
+            self._token_cache[text] = estimate
+            return estimate
+
+    @staticmethod
+    def _messages_to_token_text(messages: list[dict[str, str]]) -> str:
+        return "\n".join(
+            f"{message.get('role', '')}: {message.get('content', '')}"
+            for message in messages
+            if message.get("content")
+        )
+
+    @staticmethod
+    def _estimate_token_count(text: str) -> int:
+        if not text:
+            return 0
+        char_estimate = math.ceil(len(text) / 3)
+        word_estimate = math.ceil(len(text.split()) * 1.5)
+        return max(1, char_estimate, word_estimate)

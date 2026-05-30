@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from services.voice.agent import AgentProcessor
-from services.voice.core import ConversationWindow, TranscriptTurn, VoiceConfig, audio_to_wav_bytes, load_system_prompt, normalize_reply_text, trim_to_last_turns
+from services.voice.core import ConversationWindow, VoiceConfig, audio_to_wav_bytes, load_system_prompt, normalize_reply_text
 from services.voice.clients import VoiceDependencyError
 from services.voice.skills import Skill
 from services.voice.skills.weather import WeatherSkill
@@ -25,17 +25,26 @@ class VoiceCoreTests(unittest.TestCase):
         self.assertIn("Cass", prompt)
         self.assertNotIn("Hearth", prompt)
 
-    def test_conversation_window_trims_history(self) -> None:
-        window = ConversationWindow(system_prompt="system", history_turns=2)
+    def test_conversation_window_keeps_history_until_agent_trims(self) -> None:
+        window = ConversationWindow(system_prompt="system")
         window.add_turn("one", "reply one")
         window.add_turn("two", "reply two")
         window.add_turn("three", "reply three")
 
-        self.assertEqual(len(window.turns), 4)
-        self.assertEqual(window.turns[0].content, "two")
+        self.assertEqual(len(window.turns), 6)
+        self.assertEqual(window.turns[0].content, "one")
         messages = window.build_messages("latest question")
         self.assertEqual(messages[0]["role"], "system")
         self.assertEqual(messages[-1]["content"], "latest question")
+
+    def test_conversation_window_drops_oldest_pair_on_request(self) -> None:
+        window = ConversationWindow(system_prompt="system")
+        window.add_turn("one", "reply one")
+        window.add_turn("two", "reply two")
+
+        self.assertTrue(window.drop_oldest_turn_pair())
+
+        self.assertEqual([turn.content for turn in window.turns], ["two", "reply two"])
 
     def test_normalization_collapses_whitespace(self) -> None:
         self.assertEqual(normalize_reply_text("  hello\nworld   from  Cass  "), "hello world from Cass")
@@ -46,20 +55,6 @@ class VoiceCoreTests(unittest.TestCase):
 
         self.assertTrue(wav_bytes.startswith(b"RIFF"))
         self.assertIn(b"WAVE", wav_bytes[:16])
-
-    def test_trim_to_last_turns_returns_latest_pairs(self) -> None:
-        turns = [
-            TranscriptTurn(role="user", content="a"),
-            TranscriptTurn(role="assistant", content="b"),
-            TranscriptTurn(role="user", content="c"),
-            TranscriptTurn(role="assistant", content="d"),
-            TranscriptTurn(role="user", content="e"),
-            TranscriptTurn(role="assistant", content="f"),
-        ]
-
-        trimmed = trim_to_last_turns(turns, 2)
-
-        self.assertEqual([turn.content for turn in trimmed], ["c", "d", "e", "f"])
 
     def test_voice_config_reads_preferred_audio_device_names(self) -> None:
         from unittest.mock import patch
@@ -76,6 +71,14 @@ class VoiceCoreTests(unittest.TestCase):
 
         self.assertEqual(config.input_device_name, "Wireless Stereo Headset")
         self.assertEqual(config.output_device_name, "USB Audio")
+
+    def test_voice_config_reads_history_token_budget(self) -> None:
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"CASS_HISTORY_TOKENS": "1234"}, clear=False):
+            config = VoiceConfig.from_env()
+
+        self.assertEqual(config.history_tokens, 1234)
 
 
 class WakeWordProcessorTests(unittest.TestCase):
@@ -101,7 +104,6 @@ class WakeWordProcessorTests(unittest.TestCase):
         """Frames emitted while sleeping should NOT be pushed downstream."""
         from pipecat.frames.frames import InputAudioRawFrame
         from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.wake import WakeWordProcessor
 
         proc, detector = self._make_processor(triggered_result=(0.0, False))
 
@@ -231,7 +233,7 @@ class WakeWordProcessorTests(unittest.TestCase):
         """_flush_remaining must not go negative when a frame is larger than the flush window."""
         from pipecat.frames.frames import InputAudioRawFrame
         from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.wake import _State, WakeWordProcessor
+        from services.voice.wake import _State
 
         proc, _detector = self._make_processor(triggered_result=(0.85, True))
 
@@ -311,7 +313,7 @@ class WakeWordProcessorTests(unittest.TestCase):
         )
 
 
-class ContextTrimmerTests(unittest.TestCase):
+class WakeResetRelayTests(unittest.TestCase):
     def test_wake_reset_relay_pushes_bot_stop_upstream_on_tts_stop(self) -> None:
         """WakeResetRelay should mirror TTSStoppedFrame upstream as BotStoppedSpeakingFrame."""
         from pipecat.frames.frames import BotStoppedSpeakingFrame, TTSStoppedFrame
@@ -335,70 +337,6 @@ class ContextTrimmerTests(unittest.TestCase):
         self.assertEqual(seen[0][1], FrameDirection.UPSTREAM)
         self.assertIsInstance(seen[1][0], TTSStoppedFrame)
         self.assertEqual(seen[1][1], FrameDirection.DOWNSTREAM)
-
-    def test_context_trimmer_caps_non_system_messages(self) -> None:
-        """ContextTrimmer trims oldest turns, preserving the system message."""
-        from pipecat.frames.frames import BotStoppedSpeakingFrame
-        from pipecat.processors.aggregators.llm_context import LLMContext
-        from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.main import ContextTrimmer
-
-        context = LLMContext(messages=[
-            {"role": "system", "content": "you are cass"},
-            {"role": "user", "content": "u1"},
-            {"role": "assistant", "content": "a1"},
-            {"role": "user", "content": "u2"},
-            {"role": "assistant", "content": "a2"},
-            {"role": "user", "content": "u3"},
-            {"role": "assistant", "content": "a3"},
-            {"role": "user", "content": "u4"},
-            {"role": "assistant", "content": "a4"},
-        ])
-        trimmer = ContextTrimmer(context=context, history_turns=2)
-
-        async def run() -> None:
-            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
-                pass
-
-            trimmer.push_frame = capture  # type: ignore[method-assign]
-            await trimmer.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-
-        asyncio.run(run())
-
-        non_system = [m for m in context.messages if m.get("role") != "system"]
-        # history_turns=2 → keep last 4 messages (2 user + 2 assistant)
-        self.assertEqual(len(non_system), 4)
-        self.assertEqual(non_system[0]["content"], "u3")
-        self.assertEqual(non_system[-1]["content"], "a4")
-        # System message must survive trimming
-        self.assertEqual(context.messages[0]["role"], "system")
-        self.assertEqual(context.messages[0]["content"], "you are cass")
-
-    def test_context_trimmer_leaves_short_history_untouched(self) -> None:
-        """ContextTrimmer must not modify context already within the turn limit."""
-        from pipecat.frames.frames import BotStoppedSpeakingFrame
-        from pipecat.processors.aggregators.llm_context import LLMContext
-        from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.main import ContextTrimmer
-
-        context = LLMContext(messages=[
-            {"role": "system", "content": "you are cass"},
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "hi"},
-        ])
-        original_len = len(context.messages)
-        trimmer = ContextTrimmer(context=context, history_turns=6)
-
-        async def run() -> None:
-            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
-                pass
-
-            trimmer.push_frame = capture  # type: ignore[method-assign]
-            await trimmer.process_frame(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
-
-        asyncio.run(run())
-        self.assertEqual(len(context.messages), original_len)
-
 
 class WeatherSkillTests(unittest.TestCase):
     def test_weather_skill_extracts_location_with_preposition(self) -> None:
@@ -455,12 +393,36 @@ class AgentRouterTests(unittest.TestCase):
         self.assertEqual(score, 1.0)
         self.assertEqual(classifier_ms, 0)
 
+    def test_agent_trims_conversation_to_token_budget(self) -> None:
+        agent = AgentProcessor(
+            config=VoiceConfig(history_tokens=10),
+            skills=[],
+            embed_model_path=Path("/tmp/not-there.gguf"),
+        )
+        agent._conversation.add_turn("old question", "old answer")
+        agent._conversation.add_turn("new question", "new answer")
+
+        async def fake_count(text: str) -> int:
+            return 20 if "old question" in text else 8
+
+        agent._count_tokens_for = fake_count  # type: ignore[method-assign]
+
+        async def run() -> int:
+            return await agent._trim_conversation_to_token_budget()
+
+        context_tokens = asyncio.run(run())
+
+        self.assertEqual(context_tokens, 8)
+        self.assertEqual(
+            [turn.content for turn in agent._conversation.turns],
+            ["new question", "new answer"],
+        )
+
 
 class AgentDiagnosticsTests(unittest.TestCase):
     """End-to-end turn coverage: events + skill fallback."""
 
     def _make_agent(self, skill: Skill | None = None) -> tuple[AgentProcessor, list]:
-        from shared.straylight_shared import events as ev
         from services.voice import publisher
 
         captured: list = []

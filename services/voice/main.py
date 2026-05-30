@@ -42,7 +42,6 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.services.piper.tts import PiperTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
@@ -108,39 +107,6 @@ class LatencyObserver(FrameProcessor):
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._ttfb_logged = False
 
-        await self.push_frame(frame, direction)
-
-
-# ---------------------------------------------------------------------------
-# Context trimmer
-# ---------------------------------------------------------------------------
-
-class ContextTrimmer(FrameProcessor):
-    """Caps LLMContext.messages after each assistant turn to prevent unbounded growth.
-
-    Placed after the assistant aggregator in the pipeline. By the time
-    BotStoppedSpeakingFrame arrives here, the aggregator has already appended
-    the assistant response, so trimming is safe.
-    """
-
-    def __init__(self, context: LLMContext, history_turns: int, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self._context = context
-        self._max_non_system = history_turns * 2  # user + assistant per turn
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        await super().process_frame(frame, direction)
-        if isinstance(frame, BotStoppedSpeakingFrame):
-            msgs = self._context.messages
-            system = [m for m in msgs if m.get("role") == "system"]
-            non_system = [m for m in msgs if m.get("role") != "system"]
-            if len(non_system) > self._max_non_system:
-                self._context.messages[:] = system + non_system[-self._max_non_system:]
-                logger.debug(
-                    "context: trimmed to {} messages (history_turns={})",
-                    len(self._context.messages),
-                    self._max_non_system // 2,
-                )
         await self.push_frame(frame, direction)
 
 

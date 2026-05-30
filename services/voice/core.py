@@ -14,6 +14,7 @@ _BASE_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_FRAME_SAMPLES = 1280
 DEFAULT_WAKE_THRESHOLD = 0.5
+DEFAULT_HISTORY_TOKENS = 4096
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class VoiceConfig:
     ack_sound_path: Path = _BASE_DIR / "models" / "tts" / "ack.mp3"
     input_device_name: str | None = None
     output_device_name: str | None = None
-    history_turns: int = 6
+    history_tokens: int = DEFAULT_HISTORY_TOKENS
     embed_model_path: Path = _BASE_DIR / "models" / "embed" / "nomic-embed-text-v1.5.f16.gguf"
     router_exemplars_path: Path = _BASE_DIR / "exemplars.jsonl"
     router_threshold: float = 0.80
@@ -81,7 +82,7 @@ class VoiceConfig:
             ack_sound_path=ack_sound_path,
             input_device_name=_env_optional_str("CASS_INPUT_DEVICE_NAME"),
             output_device_name=_env_optional_str("CASS_OUTPUT_DEVICE_NAME"),
-            history_turns=_env_int("CASS_HISTORY_TURNS", 6),
+            history_tokens=_env_int("CASS_HISTORY_TOKENS", DEFAULT_HISTORY_TOKENS),
             embed_model_path=embed_model_path,
             router_exemplars_path=router_exemplars_path,
             router_threshold=_env_float("CASS_ROUTER_THRESHOLD", 0.80),
@@ -99,22 +100,35 @@ class TranscriptTurn:
 @dataclass
 class ConversationWindow:
     system_prompt: str
-    history_turns: int = 6
     turns: list[TranscriptTurn] = field(default_factory=list)
 
     def build_messages(self, user_text: str) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = [{"role": "system", "content": self.system_prompt}]
-        messages.extend({"role": turn.role, "content": turn.content} for turn in trim_to_last_turns(self.turns, self.history_turns))
-        messages.append({"role": "user", "content": normalize_reply_text(user_text)})
+        messages.extend({"role": turn.role, "content": turn.content} for turn in self.turns)
+        normalized = normalize_reply_text(user_text)
+        if normalized:
+            messages.append({"role": "user", "content": normalized})
         return messages
 
     def add_turn(self, user_text: str, assistant_text: str) -> None:
-        self.turns.append(TranscriptTurn(role="user", content=normalize_reply_text(user_text)))
-        self.turns.append(TranscriptTurn(role="assistant", content=normalize_reply_text(assistant_text)))
-        if self.history_turns > 0:
-            max_messages = self.history_turns * 2
-            if len(self.turns) > max_messages:
-                self.turns = self.turns[-max_messages:]
+        user = normalize_reply_text(user_text)
+        assistant = normalize_reply_text(assistant_text)
+        if user:
+            self.turns.append(TranscriptTurn(role="user", content=user))
+        if assistant:
+            self.turns.append(TranscriptTurn(role="assistant", content=assistant))
+
+    def drop_oldest_turn_pair(self) -> bool:
+        """Drop the oldest user/assistant pair. Returns True if anything changed."""
+        if not self.turns:
+            return False
+
+        if len(self.turns) >= 2 and self.turns[0].role == "user" and self.turns[1].role == "assistant":
+            del self.turns[:2]
+            return True
+
+        del self.turns[0]
+        return True
 
 
 
@@ -178,8 +192,3 @@ def audio_to_wav_bytes(samples: Sequence[float], sample_rate: int = DEFAULT_SAMP
         wf.writeframes(pcm)
     return buffer.getvalue()
 
-
-def trim_to_last_turns(turns: Sequence[TranscriptTurn], history_turns: int) -> list[TranscriptTurn]:
-    if history_turns <= 0:
-        return []
-    return list(turns[-history_turns * 2 :])
