@@ -180,41 +180,69 @@ async def validate_startup(config: VoiceConfig) -> None:
             "audio: no output device compatible with {}Hz: {}", config.sample_rate, exc
         )
 
+    async with httpx.AsyncClient() as client:
+        await _validate_llama_server(config, client)
+
+    logger.info("startup validation passed")
+
+
+async def _validate_llama_server(config: VoiceConfig, client: httpx.AsyncClient) -> None:
+    """Validate llama-server endpoints needed by the hot path."""
+
     health_url = f"{config.llm_base_url}/health"
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(health_url, timeout=5.0)
+        resp = await client.get(health_url, timeout=5.0)
         if resp.status_code != 200:
             raise VoiceDependencyError(
                 f"llama-server health check failed: HTTP {resp.status_code} from {health_url}"
             )
-    except httpx.ConnectError as exc:
+    except httpx.RequestError as exc:
         raise VoiceDependencyError(
             f"llama-server not reachable at {health_url} — is it running?"
+        ) from exc
+
+    tokenize_url = f"{config.llm_base_url}/tokenize"
+    try:
+        resp = await client.post(
+            tokenize_url,
+            json={"content": "tokenize startup probe"},
+            timeout=5.0,
+        )
+        if resp.status_code != 200:
+            raise VoiceDependencyError(
+                f"llama-server tokenize check failed: HTTP {resp.status_code} from {tokenize_url}"
+            )
+        tokens = resp.json().get("tokens")
+        if not isinstance(tokens, list):
+            raise VoiceDependencyError(
+                f"llama-server tokenize check failed: malformed response from {tokenize_url}"
+            )
+    except VoiceDependencyError:
+        raise
+    except (httpx.RequestError, ValueError) as exc:
+        raise VoiceDependencyError(
+            f"llama-server tokenize endpoint not usable at {tokenize_url}: {exc}"
         ) from exc
 
     # Pre-warm: llama-server can pass /health while the model is still paging in.
     # A cheap one-token call ensures first-turn latency is not a cold-start surprise.
     warmup_url = f"{config.llm_base_url}/v1/chat/completions"
     try:
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                warmup_url,
-                json={
-                    "model": config.llm_model,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 1,
-                    "temperature": 0.0,
-                },
-                timeout=20.0,
-            )
+        await client.post(
+            warmup_url,
+            json={
+                "model": config.llm_model,
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+                "temperature": 0.0,
+            },
+            timeout=20.0,
+        )
         logger.info("startup: llama-server warmup probe complete")
     except Exception as exc:
         logger.warning(
             "startup: llama-server warmup probe failed ({}); first turn may be slow", exc
         )
-
-    logger.info("startup validation passed")
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import httpx
+
 from services.voice.agent import AgentProcessor
 from services.voice.core import ConversationWindow, VoiceConfig, audio_to_wav_bytes, load_system_prompt, normalize_reply_text
 from services.voice.clients import VoiceDependencyError
@@ -204,6 +206,49 @@ class WakeWordProcessorTests(unittest.TestCase):
 
             with self.assertRaises(VoiceDependencyError):
                 asyncio.run(validate_startup(config))
+
+    def test_llama_server_validation_requires_tokenize_endpoint(self) -> None:
+        from services.voice.main import _validate_llama_server
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/health":
+                return httpx.Response(200)
+            if request.url.path == "/tokenize":
+                return httpx.Response(404)
+            return httpx.Response(200, json={})
+
+        async def run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await _validate_llama_server(
+                    VoiceConfig(llm_base_url="http://llama.test"), client
+                )
+
+        with self.assertRaisesRegex(VoiceDependencyError, "tokenize"):
+            asyncio.run(run())
+
+    def test_llama_server_validation_accepts_tokenize_tokens(self) -> None:
+        from services.voice.main import _validate_llama_server
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/health":
+                return httpx.Response(200)
+            if request.url.path == "/tokenize":
+                return httpx.Response(200, json={"tokens": [1, 2, 3]})
+            if request.url.path == "/v1/chat/completions":
+                return httpx.Response(200, json={"choices": []})
+            return httpx.Response(404)
+
+        async def run() -> None:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            ) as client:
+                await _validate_llama_server(
+                    VoiceConfig(llm_base_url="http://llama.test"), client
+                )
+
+        asyncio.run(run())
 
     def test_to_mono_pcm16_uses_first_channel(self) -> None:
         from pipecat.frames.frames import InputAudioRawFrame
