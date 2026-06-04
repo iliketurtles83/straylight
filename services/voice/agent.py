@@ -401,10 +401,14 @@ class AgentProcessor(FrameProcessor):
         full_response_parts: list[str] = []
         t_first_chunk: float | None = None
         speaking_started = False
+        last_emitted_char: str = ""
 
         try:
             async with self._llm_lock:
                 async for chunk in self._generate_response(transcript, path, skill_label):
+                    chunk = self._normalize_stream_chunk(chunk, last_emitted_char)
+                    if not chunk:
+                        continue
                     if not full_response_parts:
                         t_first_chunk = time.perf_counter()
                         # First chunk: signal start of speaking
@@ -418,6 +422,7 @@ class AgentProcessor(FrameProcessor):
                         )
                         speaking_started = True
                     full_response_parts.append(chunk)
+                    last_emitted_char = chunk[-1]
                     await self.push_frame(
                         TextFrame(text=chunk), FrameDirection.DOWNSTREAM
                     )
@@ -668,6 +673,19 @@ class AgentProcessor(FrameProcessor):
             )
             self._token_cache[text] = estimate
             return estimate
+
+    @staticmethod
+    def _normalize_stream_chunk(chunk: str, last_emitted_char: str) -> str:
+        """Insert a separator for adjacent text chunks that would otherwise join."""
+        if not chunk:
+            return ""
+        if (
+            last_emitted_char
+            and not last_emitted_char.isspace()
+            and chunk[0].isalnum()
+        ):
+            return f" {chunk}"
+        return chunk
 
     @staticmethod
     def _messages_to_token_text(messages: list[dict[str, str]]) -> str:

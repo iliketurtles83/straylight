@@ -37,6 +37,7 @@ class VoiceConfig:
     tts_model_path: Path = _BASE_DIR / "models" / "tts" / "en_US-amy-medium.onnx"
     ack_sound_path: Path = _BASE_DIR / "models" / "tts" / "ack.mp3"
     ack_player_bin: str = "ffplay"
+    bot_audio_drain_ms: int = 450
     input_device_name: str | None = None
     output_device_name: str | None = None
     history_tokens: int = DEFAULT_HISTORY_TOKENS
@@ -82,6 +83,7 @@ class VoiceConfig:
             tts_model_path=tts_model_path,
             ack_sound_path=ack_sound_path,
             ack_player_bin=os.getenv("CASS_ACK_PLAYER_BIN", "ffplay").strip() or "ffplay",
+            bot_audio_drain_ms=_env_int("CASS_BOT_AUDIO_DRAIN_MS", 450),
             input_device_name=_env_optional_str("CASS_INPUT_DEVICE_NAME"),
             output_device_name=_env_optional_str("CASS_OUTPUT_DEVICE_NAME"),
             history_tokens=_env_int("CASS_HISTORY_TOKENS", DEFAULT_HISTORY_TOKENS),

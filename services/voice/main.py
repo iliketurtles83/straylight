@@ -122,10 +122,23 @@ class WakeResetRelay(FrameProcessor):
     downstream TTSStoppedFrame for the rest of the pipeline.
     """
 
+    def __init__(self, wake_processor: WakeWordProcessor | None = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._wake = wake_processor
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
 
+        if (
+            self._wake is not None
+            and isinstance(frame, TTSAudioRawFrame)
+            and direction == FrameDirection.DOWNSTREAM
+        ):
+            self._wake.notify_bot_audio_active()
+
         if isinstance(frame, TTSStoppedFrame) and direction == FrameDirection.DOWNSTREAM:
+            if self._wake is not None:
+                self._wake.notify_bot_audio_stopped()
             await self.push_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
 
         await self.push_frame(frame, direction)
@@ -466,6 +479,7 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
             detector=detector,
             ack_path=config.ack_sound_path,
             ack_player_bin=config.ack_player_bin,
+            bot_audio_drain_ms=config.bot_audio_drain_ms,
         )
         wake_stages: list = [wake]
     else:
@@ -519,7 +533,7 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
     latency_observer = LatencyObserver(wake_processor=wake)
 
     # --- Wake reset relay ----------------------------------------------------
-    wake_reset_relay = WakeResetRelay()
+    wake_reset_relay = WakeResetRelay(wake_processor=wake)
 
     # --- Pipeline ------------------------------------------------------------
     pipeline = Pipeline([

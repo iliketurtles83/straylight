@@ -94,6 +94,14 @@ class VoiceCoreTests(unittest.TestCase):
 
         self.assertEqual(config.history_tokens, 1234)
 
+    def test_voice_config_reads_bot_audio_drain_ms(self) -> None:
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"CASS_BOT_AUDIO_DRAIN_MS": "650"}, clear=False):
+            config = VoiceConfig.from_env()
+
+        self.assertEqual(config.bot_audio_drain_ms, 650)
+
 
 class WakeWordProcessorTests(unittest.TestCase):
     def _make_processor(self, triggered_result: tuple[float, bool] = (0.0, False)):
@@ -403,6 +411,65 @@ class WakeWordProcessorTests(unittest.TestCase):
             "processor must reset to sleeping after awake timeout with no BotStoppedSpeakingFrame",
         )
 
+    def test_wake_processor_suppresses_input_while_bot_audio_active(self) -> None:
+        from pipecat.frames.frames import InputAudioRawFrame
+        from pipecat.processors.frame_processor import FrameDirection
+
+        proc, detector = self._make_processor(triggered_result=(0.0, False))
+        proc.notify_bot_audio_active()
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                raise AssertionError("suppressed input should not be forwarded")
+
+            proc.push_frame = capture  # type: ignore[method-assign]
+            frame = InputAudioRawFrame(
+                audio=b"\x00" * 3072,
+                sample_rate=16000,
+                num_channels=1,
+            )
+            await proc.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+        asyncio.run(run())
+        detector.triggered.assert_not_called()
+
+    def test_wake_processor_applies_post_stop_drain(self) -> None:
+        from pipecat.frames.frames import InputAudioRawFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        from services.voice.wake import WakeWordProcessor
+
+        detector = MagicMock()
+        detector.triggered.return_value = (0.0, False)
+        detector.reset.return_value = None
+        proc = WakeWordProcessor(
+            detector=detector,
+            ack_path=Path(tempfile.mktemp(suffix=".mp3")),
+            vad_threshold=0.0,
+            bot_audio_drain_ms=50,
+        )
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                pass
+
+            proc.push_frame = capture  # type: ignore[method-assign]
+            frame = InputAudioRawFrame(
+                audio=b"\x00" * 3072,
+                sample_rate=16000,
+                num_channels=1,
+            )
+
+            proc.notify_bot_audio_active()
+            proc.notify_bot_audio_stopped()
+            await proc.process_frame(frame, FrameDirection.DOWNSTREAM)
+            self.assertEqual(detector.triggered.call_count, 0)
+
+            await asyncio.sleep(0.07)
+            await proc.process_frame(frame, FrameDirection.DOWNSTREAM)
+
+        asyncio.run(run())
+        self.assertGreater(detector.triggered.call_count, 0)
+
 
 class WakeResetRelayTests(unittest.TestCase):
     def test_wake_reset_relay_pushes_bot_stop_upstream_on_tts_stop(self) -> None:
@@ -428,6 +495,30 @@ class WakeResetRelayTests(unittest.TestCase):
         self.assertEqual(seen[0][1], FrameDirection.UPSTREAM)
         self.assertIsInstance(seen[1][0], TTSStoppedFrame)
         self.assertEqual(seen[1][1], FrameDirection.DOWNSTREAM)
+
+    def test_wake_reset_relay_notifies_wake_on_tts_audio_and_stop(self) -> None:
+        from pipecat.frames.frames import TTSStoppedFrame, TTSAudioRawFrame
+        from pipecat.processors.frame_processor import FrameDirection
+        from services.voice.main import WakeResetRelay
+
+        wake = MagicMock()
+        relay = WakeResetRelay(wake_processor=wake)
+
+        async def run() -> None:
+            async def capture(frame, direction=FrameDirection.DOWNSTREAM):
+                pass
+
+            relay.push_frame = capture  # type: ignore[method-assign]
+            await relay.process_frame(
+                TTSAudioRawFrame(audio=b"\x00\x00", sample_rate=16000, num_channels=1),
+                FrameDirection.DOWNSTREAM,
+            )
+            await relay.process_frame(TTSStoppedFrame(), FrameDirection.DOWNSTREAM)
+
+        asyncio.run(run())
+
+        wake.notify_bot_audio_active.assert_called_once()
+        wake.notify_bot_audio_stopped.assert_called_once()
 
 class WeatherSkillTests(unittest.TestCase):
     def test_weather_skill_extracts_location_with_preposition(self) -> None:
@@ -508,6 +599,16 @@ class AgentRouterTests(unittest.TestCase):
         self.assertEqual(
             [turn.content for turn in agent._conversation.turns],
             ["new question", "new answer"],
+        )
+
+    def test_normalize_stream_chunk_inserts_separator(self) -> None:
+        self.assertEqual(
+            AgentProcessor._normalize_stream_chunk("Do you copy?", "?"),
+            " Do you copy?",
+        )
+        self.assertEqual(
+            AgentProcessor._normalize_stream_chunk(".", "o"),
+            ".",
         )
 
 

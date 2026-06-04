@@ -68,6 +68,7 @@ class WakeWordProcessor(FrameProcessor):
         ack_player_bin: str = "ffplay",
         vad_threshold: float = 0.3,
         awake_timeout_seconds: float = 30.0,
+        bot_audio_drain_ms: int = 450,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -76,8 +77,11 @@ class WakeWordProcessor(FrameProcessor):
         self._ack_player_bin = ack_player_bin
         self._vad_threshold = vad_threshold
         self._awake_timeout_seconds = awake_timeout_seconds
+        self._bot_audio_drain_ms = max(0, int(bot_audio_drain_ms))
         self._awake_timeout_task: asyncio.Task | None = None
         self._ack_task: asyncio.Task | None = None
+        self._bot_audio_active: bool = False
+        self._bot_audio_drain_until: float = 0.0
         self._state = _State.sleeping
         self._marker = _LatencyMarker()
         # RMS energy gate: 512-sample windows at 16kHz (32ms) — same granularity
@@ -160,11 +164,38 @@ class WakeWordProcessor(FrameProcessor):
     # Pipecat FrameProcessor interface
     # ------------------------------------------------------------------
 
+    def notify_bot_audio_active(self) -> None:
+        """Mark bot output as active so mic frames are suppressed."""
+        self._bot_audio_active = True
+        self._bot_audio_drain_until = 0.0
+
+    def notify_bot_audio_stopped(self) -> None:
+        """Start a short suppression drain after bot output stops."""
+        self._bot_audio_active = False
+        if self._bot_audio_drain_ms > 0:
+            self._bot_audio_drain_until = (
+                time.monotonic() + (self._bot_audio_drain_ms / 1000.0)
+            )
+        else:
+            self._bot_audio_drain_until = 0.0
+
+    def _suppress_input_audio(self) -> bool:
+        if self._bot_audio_active:
+            return True
+        if self._bot_audio_drain_until <= 0.0:
+            return False
+        if time.monotonic() < self._bot_audio_drain_until:
+            return True
+        self._bot_audio_drain_until = 0.0
+        return False
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         # logger.debug("wake: got frame type={}", type(frame).__name__)
 
         if isinstance(frame, InputAudioRawFrame):
+            if self._suppress_input_audio():
+                return
             if self._state is _State.sleeping:
                 await self._check_wake(frame)
             elif self._flush_remaining > 0:
@@ -176,6 +207,7 @@ class WakeWordProcessor(FrameProcessor):
                 await self.push_frame(frame, direction)
 
         elif isinstance(frame, BotStoppedSpeakingFrame):
+            self.notify_bot_audio_stopped()
             self._cancel_task(self._awake_timeout_task)
             self._awake_timeout_task = None
             self._cancel_task(self._ack_task)
