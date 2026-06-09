@@ -84,6 +84,16 @@ class Skill(ABC):
         """
         ...
 
+    def score(self, transcript: str) -> float:
+        """Return a confidence score (0-1) that this transcript matches
+        this skill. Used by the heuristic router to compete with the
+        embedding classifier instead of bypassing it.
+
+        Default: 0.0 — skills with no keyword vocabulary get no heuristic
+        boost. Override in subclasses.
+        """
+        return 0.0
+
     @property
     def format_prompt(self) -> str:
         """System prompt fragment for the small LLM response formatter.

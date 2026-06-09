@@ -572,7 +572,7 @@ class AgentRouterTests(unittest.TestCase):
 
         label, score, classifier_ms, source = asyncio.run(run())
         self.assertEqual(label, "dummy")
-        self.assertEqual(score, -1.0)
+        self.assertEqual(score, 0.5)
         self.assertEqual(classifier_ms, 0)
         self.assertEqual(source, "heuristic")
 

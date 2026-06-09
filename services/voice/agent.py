@@ -51,7 +51,7 @@ from shared.straylight_shared.events import (
 )
 
 from . import publisher
-from .core import ConversationWindow, VoiceConfig, load_system_prompt
+from .core import ConversationWindow, TranscriptTurn, VoiceConfig, load_system_prompt
 from .skills import Skill, SkillExecutionError
 
 
@@ -295,12 +295,13 @@ class AgentProcessor(FrameProcessor):
             (skill_label, score, classifier_ms, classifier_source)
             skill_label is None when routing to the slow path.
         """
+        heuristic_skill, heuristic_score = self._heuristic_route(text)
+
         if self._llama is None or not self._exemplar_index:
-            heuristic_skill = self._heuristic_route(text)
             if heuristic_skill is not None:
                 return (
                     heuristic_skill,
-                    -1.0,
+                    heuristic_score,
                     0,
                     self.CLASSIFIER_SOURCE_HEURISTIC,
                 )
@@ -311,11 +312,10 @@ class AgentProcessor(FrameProcessor):
             emb = await asyncio.to_thread(self._embed_sync, text)
         except Exception as exc:
             logger.warning("agent: embed failed ({}); slow path", exc)
-            heuristic_skill = self._heuristic_route(text)
             if heuristic_skill is not None:
                 return (
                     heuristic_skill,
-                    -1.0,
+                    heuristic_score,
                     0,
                     self.CLASSIFIER_SOURCE_HEURISTIC,
                 )
@@ -336,11 +336,47 @@ class AgentProcessor(FrameProcessor):
         gap = best_score - second_score
 
         logger.debug(
-            "classifier: best={!r} score={:.3f} gap={:.3f} ms={}",
-            best_label, best_score, gap, classifier_ms,
+            "classifier: best={!r} score={:.3f} gap={:.3f} ms={} heuristic={:.2f}",
+            best_label, best_score, gap, classifier_ms, heuristic_score,
         )
 
-        # Fast path only if: known skill, score >= threshold, gap sufficient.
+        # --- Merge embedding + heuristic signals -------------------------
+        # If the heuristic found a candidate, let it compete with the
+        # embedding classifier. We treat heuristic_score as an additive
+        # boost to the best embedding match when they agree on a skill.
+        if heuristic_skill is not None:
+            # Heuristic matched something — give it a chance to override
+            # the embedding if it's the top result, or at least check
+            # whether it provides a stronger signal than the embed model.
+            if best_label == heuristic_skill:
+                # Both agree: use embedding (more principled), but ensure
+                # it still meets the threshold.
+                embed_meets = (
+                    best_label != "none"
+                    and best_score >= self._threshold
+                    and gap >= self._min_gap
+                )
+                if embed_meets:
+                    return (
+                        best_label,
+                        best_score,
+                        classifier_ms,
+                        self.CLASSIFIER_SOURCE_EMBEDDING,
+                    )
+            else:
+                # Disagreement: heuristic found a skill the embed model
+                # didn't rank highly. If heuristic confidence is strong
+                # enough, trust it — it caught something the embedding
+                # model missed.
+                if heuristic_score >= 0.7:
+                    return (
+                        heuristic_skill,
+                        heuristic_score,
+                        classifier_ms,
+                        self.CLASSIFIER_SOURCE_HEURISTIC,
+                    )
+
+        # Fallback: use embedding results as-is.
         if (
             best_label != "none"
             and best_score >= self._threshold
@@ -357,15 +393,46 @@ class AgentProcessor(FrameProcessor):
 
         return None, best_score, classifier_ms, self.CLASSIFIER_SOURCE_EMBEDDING
 
-    def _heuristic_route(self, text: str) -> str | None:
-        """Fallback router used when embed classification is unavailable."""
+    def _heuristic_route(self, text: str) -> tuple[str | None, float]:
+        """Score-based heuristic router.
+
+        Primary mechanism: ``score(text)`` — a 0-1 confidence the
+        transcript matches this skill. Allows heuristic candidates to
+        compete with the embedding classifier.
+
+        Fallback for legacy skills: ``can_handle(text)`` — if a skill
+        doesn't implement ``score()`` (returns 0.0), falls back to
+        ``can_handle()`` with a neutral score of 0.5 so it still
+        participates in routing.
+        """
+        best_name: str | None = None
+        best_score: float = 0.0
+
         for skill in self._skills:
             try:
-                if skill.can_handle(text):
-                    return skill.name
+                s = skill.score(text)
             except Exception as exc:
-                logger.debug("agent: heuristic route failed for {} ({})", skill.name, exc)
-        return None
+                logger.debug("agent: heuristic score failed for {} ({})", skill.name, exc)
+                s = 0.0
+
+            if s <= 0.0:
+                # Legacy skill — no score() impl. Fall back to can_handle()
+                # with a neutral confidence so it still routes.
+                try:
+                    if skill.can_handle(text):
+                        s = 0.5
+                    else:
+                        continue
+                except Exception:
+                    continue
+
+            if s > best_score:
+                best_score = s
+                best_name = skill.name
+
+        if best_name is not None:
+            return (best_name, best_score)
+        return (None, 0.0)
 
     # ------------------------------------------------------------------
     # Main turn handler
@@ -565,11 +632,28 @@ class AgentProcessor(FrameProcessor):
         entities = skill.entities(transcript)
         raw_result = await skill.execute(entities)
 
-        messages = [
-            {"role": "system", "content": skill.format_prompt},
-            {"role": "user", "content": raw_result},
-        ]
+        history = self._conversation_history_turns()
+        messages = self._build_messages_with_history(transcript, history, skill.format_prompt)
+        messages.append({"role": "user", "content": raw_result})
         return await self._llm_single_shot(messages)
+
+    def _conversation_history_turns(self) -> list[TranscriptTurn]:
+        """Return the last 2 conversation turns for fast-path context."""
+        # Each turn pair is 2 entries (user + assistant), so we grab the last 4.
+        return self._conversation.turns[-4:]
+
+    @staticmethod
+    def _build_messages_with_history(
+        transcript: str,
+        history: list[TranscriptTurn],
+        format_prompt: str,
+    ) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": format_prompt},
+        ]
+        messages.extend({"role": turn.role, "content": turn.content} for turn in history)
+        messages.append({"role": "user", "content": transcript})
+        return messages
 
     # ------------------------------------------------------------------
     # LLM helpers
