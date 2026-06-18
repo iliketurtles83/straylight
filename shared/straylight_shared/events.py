@@ -24,12 +24,18 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
+# Base Event class for all events
+class Event:
+    """Base Event class for all events in the system."""
+    pass
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
 @dataclass
-class TranscriptEvent:
+class TranscriptEvent(Event):
     """Emitted when Whisper produces a transcript for a turn."""
 
     text: str
@@ -39,7 +45,7 @@ class TranscriptEvent:
 
 
 @dataclass
-class IntentEvent:
+class IntentEvent(Event):
     """Emitted when AgentProcessor classifies a transcript and picks a path."""
 
     path: Literal["fast", "slow"]
@@ -53,7 +59,7 @@ class IntentEvent:
 
 
 @dataclass
-class ToolCallEvent:
+class ToolCallEvent(Event):
     """Emitted when a skill or slow-path ReAct loop invokes an MCP tool."""
 
     tool: str
@@ -64,7 +70,7 @@ class ToolCallEvent:
 
 
 @dataclass
-class ToolResultEvent:
+class ToolResultEvent(Event):
     """Emitted when an MCP tool returns a result."""
 
     tool: str
@@ -76,7 +82,7 @@ class ToolResultEvent:
 
 
 @dataclass
-class SpeakingEvent:
+class SpeakingEvent(Event):
     """Emitted when TTS output starts or stops."""
 
     state: Literal["start", "stop"]
@@ -87,7 +93,7 @@ class SpeakingEvent:
 
 
 @dataclass
-class StateEvent:
+class StateEvent(Event):
     """Emitted on every pipeline state transition.
 
     Gateway UI uses this to drive the state badge.
@@ -101,7 +107,7 @@ class StateEvent:
 
 
 @dataclass
-class TurnDiagnosticsEvent:
+class TurnDiagnosticsEvent(Event):
     """End-of-turn UI metadata. Drives the diagnostics panel in Phase 4.
 
     Populated by AgentProcessor after the response stream finishes (or after

@@ -1,32 +1,20 @@
-"""Event publisher — Phase 2 stub.
+"""Event publisher for Straylight voice service.
 
-Provides the same interface that Phase 4 will wire to Redis. All
-AgentProcessor publish() calls go through this module so Phase 4 only
-needs to replace the implementation here, not touch agent.py.
-
-Phase 4 implementation: aioredis client, publishes JSON-serialised
-dataclass to the channel named in event.channel.
+This module provides the interface that AgentProcessor uses to publish events.
+In Phase 2, this forwards events to the Redis-based event bus in the agent service.
 """
 
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
 from typing import Any
 
-from loguru import logger
+# Import the Redis-based publisher from the agent service
+from agent.bus import publish as agent_publish
 
 
 async def publish(event: Any) -> None:
-    """Publish a Straylight event.
+    """Publish a Straylight event via the agent service's event bus.
 
-    Stub: logs at DEBUG level. Phase 4 replaces this with Redis pub/sub.
+    This forwards events from the voice pipeline to the central event bus.
     """
-    try:
-        logger.debug(
-            "event: {} {}",
-            event.__class__.__name__,
-            json.dumps(asdict(event), default=str),
-        )
-    except Exception:
-        pass
+    await agent_publish(event)

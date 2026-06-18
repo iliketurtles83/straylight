@@ -50,7 +50,8 @@ from shared.straylight_shared.events import (
     TurnDiagnosticsEvent,
 )
 
-from . import publisher
+# Import the new Redis event bus publisher
+from agent.bus import publish as agent_publish
 from .core import ConversationWindow, TranscriptTurn, VoiceConfig, load_system_prompt
 from .skills import Skill, SkillExecutionError
 
@@ -448,21 +449,21 @@ class AgentProcessor(FrameProcessor):
         )
         path = "fast" if skill_label is not None else "slow"
 
-        # --- Publish pre-LLM events -----------------------------------
-        await publisher.publish(
+       # --- Publish pre-LLM events -----------------------------------
+        await agent_publish(
             TranscriptEvent(text=transcript, session_id=self._session_id)
         )
-        await publisher.publish(
+        await agent_publish(
             IntentEvent(
                 path=path,
                 skill_label=skill_label,
                 confidence=score,
-                classifier_source=classifier_source,
+                classifier_source="nomic-embed",
                 classifier_ms=classifier_ms,
                 session_id=self._session_id,
             )
         )
-        await publisher.publish(StateEvent(state="thinking", session_id=self._session_id))
+        await agent_publish(StateEvent(state="thinking", session_id=self._session_id))
 
         # --- Generate and stream response ----------------------------
         full_response_parts: list[str] = []
@@ -479,12 +480,12 @@ class AgentProcessor(FrameProcessor):
                     if not full_response_parts:
                         t_first_chunk = time.perf_counter()
                         # First chunk: signal start of speaking
-                        await publisher.publish(
+                        await agent_publish(
                             SpeakingEvent(
                                 state="start", text="", session_id=self._session_id
                             )
                         )
-                        await publisher.publish(
+                        await agent_publish(
                             StateEvent(state="speaking", session_id=self._session_id)
                         )
                         speaking_started = True
@@ -496,19 +497,19 @@ class AgentProcessor(FrameProcessor):
 
         except asyncio.CancelledError:
             if speaking_started:
-                await publisher.publish(
+                await agent_publish(
                     SpeakingEvent(state="stop", text="", session_id=self._session_id)
                 )
-            await publisher.publish(StateEvent(state="idle", session_id=self._session_id))
+            await agent_publish(StateEvent(state="idle", session_id=self._session_id))
             logger.debug("agent: turn cancelled (barge-in)")
             raise
 
         except Exception as exc:
             if speaking_started:
-                await publisher.publish(
+                await agent_publish(
                     SpeakingEvent(state="stop", text="", session_id=self._session_id)
                 )
-            await publisher.publish(StateEvent(state="idle", session_id=self._session_id))
+            await agent_publish(StateEvent(state="idle", session_id=self._session_id))
             logger.error("agent: unhandled error in turn: {}", exc)
             raise
 
@@ -538,13 +539,13 @@ class AgentProcessor(FrameProcessor):
         )
 
         # --- Publish post-turn events ----------------------------------
-        await publisher.publish(
+        await agent_publish(
             SpeakingEvent(
                 state="stop", text=full_response, session_id=self._session_id
             )
         )
-        await publisher.publish(StateEvent(state="idle", session_id=self._session_id))
-        await publisher.publish(
+        await agent_publish(StateEvent(state="idle", session_id=self._session_id))
+        await agent_publish(
             TurnDiagnosticsEvent(
                 session_id=self._session_id,
                 path=path,  # type: ignore[arg-type]

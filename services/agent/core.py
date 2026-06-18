@@ -46,6 +46,8 @@ class VoiceConfig:
     router_threshold: float = 0.80
     router_min_gap: float = 0.05
     listen_mode: bool = False  # skip wake word; pipeline always active
+    llm_ctx_size: int = 32768  # context window size for LLM
+    llm_output_size: int = 1024  # maximum output tokens for LLM
 
     @classmethod
     def from_env(cls) -> "VoiceConfig":
@@ -92,6 +94,8 @@ class VoiceConfig:
             router_threshold=_env_float("CASS_ROUTER_THRESHOLD", 0.80),
             router_min_gap=_env_float("CASS_ROUTER_MIN_GAP", 0.05),
             listen_mode=os.getenv("CASS_LISTEN_MODE", "").strip().lower() in ("1", "true", "yes"),
+            llm_ctx_size=_env_int("CASS_LLM_CTX_SIZE", 32768),
+            llm_output_size=_env_int("CASS_LLM_OUTPUT_SIZE", 1024),
         )
 
 

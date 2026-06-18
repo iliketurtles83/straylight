@@ -71,6 +71,9 @@ HEALTH_INTERVAL=2
 # Expose base URL so VoiceConfig picks up the right port automatically.
 export CASS_LLM_BASE_URL="http://127.0.0.1:${LLAMA_PORT}"
 
+# Check if we should skip starting llama-server
+: "${CASS_SKIP_LLM_SERVER_START:=false}"
+
 # --------------------------------------------------------------------------
 # Validate environment
 # --------------------------------------------------------------------------
@@ -100,7 +103,10 @@ fi
 # Start llama-server (skip if already healthy on the target port)
 # --------------------------------------------------------------------------
 LLAMA_PID=""
-if curl -sf "${HEALTH_URL}" > /dev/null 2>&1; then
+if [[ "${CASS_SKIP_LLM_SERVER_START}" == "true" ]]; then
+  echo "[dev_gemma.sh] CASS_SKIP_LLM_SERVER_START set to true — skipping llama-server launch"
+  echo "[dev_gemma.sh] Please ensure your LLM server is running at ${CASS_LLM_BASE_URL}"
+elif curl -sf "${HEALTH_URL}" > /dev/null 2>&1; then
   echo "[dev_gemma.sh] llama-server already healthy on ${HEALTH_URL} — skipping launch"
 else
   echo "[dev_gemma.sh] starting llama-server"

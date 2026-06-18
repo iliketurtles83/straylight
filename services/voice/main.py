@@ -48,7 +48,7 @@ from pipecat.services.piper.tts import PiperTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
-from .agent import AgentProcessor
+from agent import AgentProcessor
 from .clients import OpenWakeWordDetector, VoiceDependencyError
 from .core import VoiceConfig
 from .skills.weather import WeatherSkill
@@ -155,7 +155,7 @@ async def validate_startup(config: VoiceConfig) -> None:
         wake_files = [
             config.wake_model_dir / config.wakeword_model_file,
             config.wake_model_dir / config.wakeword_melspec_model_file,
-            config.wake_model_dir / config.wakeword_embedding_model_file,
+            config.wakeword_embedding_model_file,
         ]
         for p in wake_files:
             if not p.exists():
@@ -195,8 +195,17 @@ async def validate_startup(config: VoiceConfig) -> None:
             "audio: no output device compatible with {}Hz: {}", config.sample_rate, exc
         )
 
+    # Check if LLM server is reachable (but don't require it to be running)
     async with httpx.AsyncClient() as client:
-        await _validate_llama_server(config, client)
+        try:
+            await _validate_llama_server_health(config, client)
+        except VoiceDependencyError:
+            # If the server is not reachable, warn but don't fail the startup
+            # This allows Straylight to connect to an external server
+            logger.warning(
+                "llama-server not reachable at {} — assuming external server connection",
+                config.llm_base_url
+            )
 
     logger.info("startup validation passed")
 
@@ -212,8 +221,8 @@ def _validate_ack_player_binary(config: VoiceConfig) -> None:
         )
 
 
-async def _validate_llama_server(config: VoiceConfig, client: httpx.AsyncClient) -> None:
-    """Validate llama-server endpoints needed by the hot path."""
+async def _validate_llama_server_health(config: VoiceConfig, client: httpx.AsyncClient) -> None:
+    """Validate llama-server health endpoint only."""
 
     health_url = f"{config.llm_base_url}/health"
     try:
@@ -227,6 +236,14 @@ async def _validate_llama_server(config: VoiceConfig, client: httpx.AsyncClient)
             f"llama-server not reachable at {health_url} — is it running?"
         ) from exc
 
+
+async def _validate_llama_server(config: VoiceConfig, client: httpx.AsyncClient) -> None:
+    """Validate llama-server endpoints needed by the hot path."""
+
+    # Check health first
+    await _validate_llama_server_health(config, client)
+
+    # Validate tokenize endpoint
     tokenize_url = f"{config.llm_base_url}/tokenize"
     try:
         resp = await client.post(

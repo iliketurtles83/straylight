@@ -1,0 +1,23 @@
+# Straylight voice service requirements
+
+# Core dependencies
+llama-cpp-python
+openwakeword==0.4.0
+pyaudio
+sounddevice
+numpy
+torch
+transformers
+accelerate
+
+# Voice service dependencies
+pipecat-ai
+pydantic
+asyncio
+aiofiles
+uvicorn
+fastapi
+
+# Testing dependencies
+pytest
+pytest-asyncio

@@ -1,0 +1,4 @@
+# Gateway service requirements
+fastapi
+uvicorn
+aioredis
