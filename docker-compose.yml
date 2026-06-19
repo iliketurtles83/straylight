@@ -1,5 +1,4 @@
 # Straylight Docker Compose Setup
-version: '3.8'
 
 services:
   redis:

@@ -48,7 +48,7 @@ from pipecat.services.piper.tts import PiperTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
-from agent import AgentProcessor
+from services.agent.runtime import CassRuntime, RuntimeConfig
 from .clients import OpenWakeWordDetector, VoiceDependencyError
 from .core import VoiceConfig
 from .skills.weather import WeatherSkill
@@ -513,16 +513,24 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
         ),
     )
 
-    # --- AgentProcessor ------------------------------------------------------
-    none_exemplars = _load_none_exemplars(config.router_exemplars_path)
-    agent = AgentProcessor(
-        config=config,
-        skills=[WeatherSkill()],
+    # --- CassRuntime ---------------------------------------------------------
+    # Create runtime config
+    runtime_config = RuntimeConfig(
+        llm_base_url=config.llm_base_url,
+        llm_model=config.llm_model,
         embed_model_path=config.embed_model_path,
-        none_exemplars=none_exemplars,
-        threshold=config.router_threshold,
-        min_gap=config.router_min_gap,
+        router_exemplars_path=config.router_exemplars_path,
+        router_threshold=config.router_threshold,
+        router_min_gap=config.router_min_gap,
+        history_tokens=config.history_tokens,
+        llm_ctx_size=config.llm_ctx_size,
+        llm_output_size=config.llm_output_size,
+        redis_url=config.redis_url,
+        mcp_server_urls=config.mcp_server_urls,
     )
+    
+    # Create CassRuntime instance
+    runtime = CassRuntime(runtime_config)
 
     # --- TTS -----------------------------------------------------------------
     tts = PiperTTSService(

@@ -51,7 +51,6 @@ class IntentEvent(Event):
     path: Literal["fast", "slow"]
     skill_label: str | None          # None on slow path
     confidence: float                # Cosine score; -1 when classifier not used
-    classifier_source: Literal["embedding", "heuristic", "disabled"]
     classifier_ms: int               # Time taken by nomic-embed classifier
     session_id: str
     timestamp_ms: int = field(default_factory=_now_ms)
@@ -124,7 +123,6 @@ class TurnDiagnosticsEvent(Event):
     output_tokens: int
     tokens_per_sec: float
     classifier_confidence: float
-    classifier_source: Literal["embedding", "heuristic", "disabled"]
     classifier_ms: int
     agent_ms: int
     ttfb_ms: int

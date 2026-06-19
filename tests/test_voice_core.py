@@ -616,7 +616,7 @@ class AgentDiagnosticsTests(unittest.TestCase):
     """End-to-end turn coverage: events + skill fallback."""
 
     def _make_agent(self, skill: Skill | None = None) -> tuple[AgentProcessor, list]:
-        from services.voice import publisher
+        from services.agent import publisher
 
         captured: list = []
 

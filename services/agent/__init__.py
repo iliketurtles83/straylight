@@ -2,7 +2,7 @@
 
 from .bus import publish
 from .agent import AgentProcessor
-from .core import ConversationWindow
+from .agent_core import ConversationWindow
 
 __all__ = [
     "publish",
