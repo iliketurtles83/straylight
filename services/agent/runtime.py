@@ -11,11 +11,11 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List
 
-from services.agent.bus import get_event_bus
 from services.agent.classifier import Classifier
 from services.agent.tools import ToolRegistry
 from services.agent.agent_core import VoiceConfig, ConversationWindow
 from services.agent.weather_tool import WEATHER_TOOL
+from services.agent.observer import TurnObserver
 from shared.straylight_shared.events import StateEvent
 
 
@@ -42,9 +42,9 @@ class CassRuntime:
     by delegating to specialized modules like Classifier and ToolRegistry.
     """
 
-    def __init__(self, config: RuntimeConfig):
+    def __init__(self, config: RuntimeConfig, observer: TurnObserver | None = None):
         self._config = config
-        self._event_bus = None
+        self._observer = observer
         self._classifier = None
         self._tool_registry = None
         self._conversation_windows: Dict[str, ConversationWindow] = {}
@@ -54,35 +54,28 @@ class CassRuntime:
         """Initialize the runtime components.
         
         This method:
-        1. Connects to the event bus (raises on failure)
-        2. Loads classifier embed model and builds exemplar index
-        3. Registers tools in ToolRegistry
-        4. Subscribes to cass:input
-        5. Emits StateEvent(idle)
+        1. Loads classifier embed model and builds exemplar index
+        2. Registers tools in ToolRegistry
+        3. Emits StateEvent(idle)
         """
-        # 1. Connect bus
-        self._event_bus = await get_event_bus()
-        
-        # 2. Load classifier embed model and build exemplar index
+        # 1. Load classifier embed model and build exemplar index
         self._classifier = Classifier(self._config.embed_model_path)
         await self._classifier.startup()
         
         # Load and register exemplars from exemplars.jsonl
         await self._load_exemplars()
         
-        # 3. Register tools in ToolRegistry
-        self._tool_registry = ToolRegistry()
+        # 2. Register tools in ToolRegistry
+        self._tool_registry = ToolRegistry(observer=self._observer)
         # Register the weather tool
         self._tool_registry.register(WEATHER_TOOL)
         
-        # 4. Subscribe to cass:input (this will be handled by the gateway)
-        # We don't need to do anything here since the gateway will publish to cass:input
-        
-        # 5. Emit StateEvent(idle)
-        await self._event_bus.publish(StateEvent(
-            state="idle",
-            session_id="default",
-        ))
+        # 3. Emit StateEvent(idle)
+        if self._observer:
+            await self._observer.notify(StateEvent(
+                state="idle",
+                session_id="default",
+            ))
         
         print("CassRuntime started successfully")
 
@@ -177,7 +170,7 @@ class CassRuntime:
             result = await self._slow_path(text, session_id)
         
         # Update conversation window
-        conversation.add_turn(text)
+        conversation.add_turn(text, result)
         
         print(f"Processing turn for session {session_id}: {text}")
 
@@ -195,7 +188,7 @@ class CassRuntime:
         # Call the tool registry with mock arguments
         # In a real implementation, we'd parse the text to extract arguments
         try:
-            result = await self._tool_registry.call(tool_name, {"location": "San Francisco"})
+            result = await self._tool_registry.call(tool_name, {"location": "San Francisco"}, session_id)
             return result.content
         except Exception as e:
             print(f"Fast path execution failed: {e}")

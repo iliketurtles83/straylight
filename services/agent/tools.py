@@ -42,8 +42,9 @@ class ToolExecutionError(Exception):
 class ToolRegistry:
     """Registry for managing tools and their execution."""
     
-    def __init__(self) -> None:
+    def __init__(self, observer: TurnObserver | None = None) -> None:
         self._tools: Dict[str, ToolSpec] = {}
+        self._observer = observer
     
     def register(self, spec: ToolSpec) -> None:
         """Register a tool specification.
@@ -59,12 +60,13 @@ class ToolRegistry:
         self._tools[spec.name] = spec
         print(f"Registered tool: {spec.name}")
     
-    async def call(self, tool_name: str, args: dict) -> ToolResult:
+    async def call(self, tool_name: str, args: dict, session_id: str = "default") -> ToolResult:
         """Execute a tool with the given arguments.
         
         Args:
             tool_name: Name of the tool to execute
             args: Arguments to pass to the tool
+            session_id: The session identifier
             
         Returns:
             ToolResult containing the execution result
@@ -78,18 +80,15 @@ class ToolRegistry:
             raise ToolNotFoundError(f"Tool not found: {tool_name}")
         
         try:
-            # Get event bus to publish events
-            from services.agent.bus import get_event_bus
-            event_bus = await get_event_bus()
-            
             # Publish tool call event
             tool_call_event = ToolCallEvent(
                 tool=tool_name,
                 args=args,
-                session_id="default",
+                session_id=session_id,
                 timestamp_ms=int(asyncio.get_event_loop().time() * 1000),
             )
-            await event_bus.publish(tool_call_event)
+            if self._observer:
+                await self._observer.notify(tool_call_event)
             
             # Execute the tool
             start_time = asyncio.get_event_loop().time()
@@ -112,10 +111,11 @@ class ToolRegistry:
                     "structured": result.structured
                 },
                 tool_call_ms=latency_ms,
-                session_id="default",
+                session_id=session_id,
                 timestamp_ms=int(asyncio.get_event_loop().time() * 1000),
             )
-            await event_bus.publish(tool_result_event)
+            if self._observer:
+                await self._observer.notify(tool_result_event)
             
             return result
             
