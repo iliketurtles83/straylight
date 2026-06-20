@@ -12,11 +12,12 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 from services.agent.classifier import Classifier
-from services.agent.tools import ToolRegistry
+from services.agent.tools import ToolRegistry, ToolSpec, ToolResult
 from services.agent.agent_core import VoiceConfig, ConversationWindow
-from services.agent.weather_tool import WEATHER_TOOL
+from services.agent.skills.weather import WeatherSkill
+from services.agent.skills import Skill
 from services.agent.observer import TurnObserver
-from shared.straylight_shared.events import StateEvent
+from shared.straylight_shared.events import StateEvent, IntentEvent
 
 
 @dataclass
@@ -67,8 +68,11 @@ class CassRuntime:
         
         # 2. Register tools in ToolRegistry
         self._tool_registry = ToolRegistry(observer=self._observer)
-        # Register the weather tool
-        self._tool_registry.register(WEATHER_TOOL)
+        
+        # Register the weather tool (real implementation)
+        weather_skill = WeatherSkill()
+        weather_tool_spec = self._create_weather_tool_spec(weather_skill)
+        self._tool_registry.register(weather_tool_spec)
         
         # 3. Emit StateEvent(idle)
         if self._observer:
@@ -78,6 +82,36 @@ class CassRuntime:
             ))
         
         print("CassRuntime started successfully")
+
+    def _create_weather_tool_spec(self, skill: WeatherSkill) -> ToolSpec:
+        """Create a ToolSpec from the WeatherSkill."""
+        async def execute_weather_tool(args: dict) -> ToolResult:
+            # Extract location using skill's entity extraction
+            entities = skill.entities(args.get("text", ""))
+            # Execute the skill with the extracted entities
+            result_string = await skill.execute(entities)
+            return ToolResult(
+                content=result_string,
+                structured={"entities": entities, "result": result_string},
+                tool_name="weather",
+                latency_ms=0  # Would measure actual latency in production
+            )
+        
+        return ToolSpec(
+            name="weather",
+            description="Get current weather information for a location",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The input text containing location information"
+                    }
+                },
+                "required": ["text"]
+            },
+            execute=execute_weather_tool
+        )
 
     async def _load_exemplars(self) -> None:
         """Load exemplars from exemplars.jsonl and register them with the classifier."""
@@ -155,6 +189,16 @@ class CassRuntime:
         # Classify the intent
         classifier_result = await self._classifier.classify(text)
         
+        # Emit IntentEvent for the classification result
+        if self._observer:
+            await self._observer.notify(IntentEvent(
+                tool=classifier_result.tool_name,
+                confidence=classifier_result.confidence,
+                source=classifier_result.source,
+                session_id=session_id,
+                timestamp_ms=int(asyncio.get_event_loop().time() * 1000),
+            ))
+        
         # Route to fast or slow path based on classification result
         if classifier_result.tool_name is not None:
             # Fast path: execute the tool
@@ -185,14 +229,29 @@ class CassRuntime:
         Returns:
             The result of the tool execution
         """
-        # Call the tool registry with mock arguments
-        # In a real implementation, we'd parse the text to extract arguments
         try:
-            result = await self._tool_registry.call(tool_name, {"location": "San Francisco"}, session_id)
+            # Get the skill for this tool
+            skill = self._get_skill_for_tool(tool_name)
+            if skill is None:
+                raise ValueError(f"No skill found for tool: {tool_name}")
+            
+            # Extract entities from text using skill's entity extraction
+            entities = skill.entities(text)
+            
+            # Call the tool registry with the extracted entities
+            result = await self._tool_registry.call(tool_name, {"text": text}, session_id)
             return result.content
         except Exception as e:
             print(f"Fast path execution failed: {e}")
             raise
+
+    def _get_skill_for_tool(self, tool_name: str) -> Skill | None:
+        """Get the skill associated with a tool name."""
+        # This is a simplified approach - in the future we might have a more 
+        # sophisticated mapping between tools and skills
+        if tool_name == "weather":
+            return WeatherSkill()
+        return None
 
     async def _slow_path(self, text: str, session_id: str) -> str:
         """Execute the slow path using LLM.

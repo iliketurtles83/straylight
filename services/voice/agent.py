@@ -108,10 +108,10 @@ class AgentProcessor(FrameProcessor):
         
         # Publish intent event with correct classifier_source
         intent_event = IntentEvent(
-            text=text,
-            tool_name=classifier_result.tool_name,
+            path="fast" if classifier_result.tool_name else "slow",
+            skill_label=classifier_result.tool_name,
             confidence=classifier_result.confidence,
-            classifier_source=classifier_source,  # FIXED: Use the variable, not hardcoded "nomic-embed"
+            classifier_ms=0,  # This would be set to actual latency in production
             session_id=session_id,
             timestamp_ms=int(time.time() * 1000),
         )
@@ -217,8 +217,8 @@ class AgentProcessor(FrameProcessor):
             
             # Publish tool call event
             tool_call_event = ToolCallEvent(
-                tool_name=tool_name,
-                entities=entities,
+                tool=tool_name,
+                args=entities,
                 session_id=session_id,
                 timestamp_ms=int(time.time() * 1000),
             )
@@ -226,8 +226,12 @@ class AgentProcessor(FrameProcessor):
             
             # Publish tool result event
             tool_result_event = ToolResultEvent(
-                tool_name=tool_name,
-                content=result,
+                tool=tool_name,
+                result={
+                    "content": result,
+                    "structured": None  # This would be populated by the skill if it provides structured data
+                },
+                tool_call_ms=0,  # Would be set to actual latency in production
                 session_id=session_id,
                 timestamp_ms=int(time.time() * 1000),
             )
