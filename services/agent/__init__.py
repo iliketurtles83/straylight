@@ -1,7 +1,7 @@
 """Agent service package initialization."""
 
 from .bus import publish
-from .agent import AgentProcessor
+from ..voice.agent import AgentProcessor
 from .agent_core import ConversationWindow
 
 __all__ = [

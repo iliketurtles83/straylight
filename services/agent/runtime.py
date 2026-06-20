@@ -15,6 +15,7 @@ from services.agent.bus import get_event_bus
 from services.agent.classifier import Classifier
 from services.agent.tools import ToolRegistry
 from services.agent.agent_core import VoiceConfig, ConversationWindow
+from services.agent.weather_tool import WEATHER_TOOL
 from shared.straylight_shared.events import StateEvent
 
 
@@ -66,9 +67,13 @@ class CassRuntime:
         self._classifier = Classifier(self._config.embed_model_path)
         await self._classifier.startup()
         
+        # Load and register exemplars from exemplars.jsonl
+        await self._load_exemplars()
+        
         # 3. Register tools in ToolRegistry
         self._tool_registry = ToolRegistry()
-        # In a real implementation, tools would be registered here
+        # Register the weather tool
+        self._tool_registry.register(WEATHER_TOOL)
         
         # 4. Subscribe to cass:input (this will be handled by the gateway)
         # We don't need to do anything here since the gateway will publish to cass:input
@@ -80,6 +85,44 @@ class CassRuntime:
         ))
         
         print("CassRuntime started successfully")
+
+    async def _load_exemplars(self) -> None:
+        """Load exemplars from exemplars.jsonl and register them with the classifier."""
+        from pathlib import Path
+        import json
+        
+        exemplars_path = Path(self._config.router_exemplars_path)
+        if not exemplars_path.exists():
+            print(f"Warning: exemplars file not found at {exemplars_path}")
+            return
+            
+        # Group exemplars by label
+        exemplar_groups: dict[str, list[str]] = {}
+        try:
+            with open(exemplars_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line)
+                        text = data.get('text', '')
+                        label = data.get('label', '')
+                        if text and label:
+                            if label not in exemplar_groups:
+                                exemplar_groups[label] = []
+                            exemplar_groups[label].append(text)
+                    except json.JSONDecodeError:
+                        print(f"Warning: Invalid JSON line in exemplars file: {line}")
+                        
+        except Exception as e:
+            print(f"Error loading exemplars: {e}")
+            return
+            
+        # Register exemplars with classifier
+        for label, exemplars in exemplar_groups.items():
+            self._classifier.register_exemplars(label, exemplars)
+            print(f"Registered {len(exemplars)} exemplars for label '{label}'")
 
     async def shutdown(self) -> None:
         """Shut down the runtime components."""
@@ -119,13 +162,23 @@ class CassRuntime:
         # Classify the intent
         classifier_result = await self._classifier.classify(text)
         
-        # In a real implementation, we would now route to fast or slow path
-        # For now, we'll just simulate the process
+        # Route to fast or slow path based on classification result
+        if classifier_result.tool_name is not None:
+            # Fast path: execute the tool
+            try:
+                result = await self._fast_path(text, classifier_result.tool_name, session_id)
+                print(f"Fast path result for '{text}': {result}")
+            except Exception as e:
+                print(f"Fast path execution failed: {e}")
+                # Fall back to slow path
+                result = await self._slow_path(text, session_id)
+        else:
+            # Slow path: use LLM
+            result = await self._slow_path(text, session_id)
         
         # Update conversation window
         conversation.add_turn(text)
         
-        # For now, just simulate processing
         print(f"Processing turn for session {session_id}: {text}")
 
     async def _fast_path(self, text: str, tool_name: str, session_id: str) -> str:
@@ -139,10 +192,14 @@ class CassRuntime:
         Returns:
             The result of the tool execution
         """
-        # In a real implementation, this would call the tool registry
-        # For now, we'll simulate a tool execution
-        print(f"Executing fast path tool: {tool_name}")
-        return f"Result from {tool_name} tool"
+        # Call the tool registry with mock arguments
+        # In a real implementation, we'd parse the text to extract arguments
+        try:
+            result = await self._tool_registry.call(tool_name, {"location": "San Francisco"})
+            return result.content
+        except Exception as e:
+            print(f"Fast path execution failed: {e}")
+            raise
 
     async def _slow_path(self, text: str, session_id: str) -> str:
         """Execute the slow path using LLM.
