@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, Awaitable, Dict, List
 
 from shared.straylight_shared.events import ToolCallEvent, ToolResultEvent
+from services.agent.observer import TurnObserver
 
 
 @dataclass(frozen=True)
@@ -112,10 +113,10 @@ class ToolRegistry:
                 },
                 tool_call_ms=latency_ms,
                 session_id=session_id,
-                timestamp_ms=int(asyncio.get_event_loop().time() * 1000),
+                timestamp_ms=int(time.time() * 1000),
             )
             if self._observer:
-                await self._observer.notify(tool_result_event)
+                self._observer.notify(tool_result_event)
             
             return result
             

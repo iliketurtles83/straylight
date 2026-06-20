@@ -32,8 +32,7 @@ class RuntimeConfig:
     history_tokens: int
     llm_ctx_size: int
     llm_output_size: int
-    redis_url: str
-    mcp_server_urls: List[str]
+    prompt_path: str
 
 
 class CassRuntime:
@@ -76,7 +75,7 @@ class CassRuntime:
         
         # 3. Emit StateEvent(idle)
         if self._observer:
-            await self._observer.notify(StateEvent(
+            self._observer.notify(StateEvent(
                 state="idle",
                 session_id="default",
             ))
@@ -179,8 +178,10 @@ class CassRuntime:
         """
         # Get or create conversation window for session
         if session_id not in self._conversation_windows:
+            from services.agent.agent_core import load_system_prompt
+            system_prompt = load_system_prompt(Path(self._config.prompt_path))
             self._conversation_windows[session_id] = ConversationWindow(
-                system_prompt="",
+                system_prompt=system_prompt,
                 turns=[],
             )
         
@@ -192,11 +193,11 @@ class CassRuntime:
         # Emit IntentEvent for the classification result
         if self._observer:
             await self._observer.notify(IntentEvent(
-                tool=classifier_result.tool_name,
+                path="fast" if classifier_result.tool_name else "slow",
+                skill_label=classifier_result.tool_name,
                 confidence=classifier_result.confidence,
-                source=classifier_result.source,
+                classifier_ms=classifier_result.classifier_ms,
                 session_id=session_id,
-                timestamp_ms=int(asyncio.get_event_loop().time() * 1000),
             ))
         
         # Route to fast or slow path based on classification result
@@ -218,12 +219,12 @@ class CassRuntime:
         
         print(f"Processing turn for session {session_id}: {text}")
 
-    async def _fast_path(self, text: str, tool_name: str, session_id: str) -> str:
-        """Execute the fast path for a tool call.
+async def _fast_path(self, text: str, tool_name: str, session_id: str) -> str:
+        """Execute the fast path using a tool.
         
         Args:
             text: The input text
-            tool_name: The tool to execute
+            tool_name: The name of the tool to execute
             session_id: The session identifier
             
         Returns:
@@ -238,8 +239,8 @@ class CassRuntime:
             # Extract entities from text using skill's entity extraction
             entities = skill.entities(text)
             
-            # Call the tool registry with the extracted entities
-            result = await self._tool_registry.call(tool_name, {"text": text}, session_id)
+            # Call the tool registry with the already extracted entities
+            result = await self._tool_registry.call(tool_name, {"text": text, "entities": entities}, session_id)
             return result.content
         except Exception as e:
             print(f"Fast path execution failed: {e}")
@@ -263,7 +264,42 @@ class CassRuntime:
         Returns:
             The LLM response
         """
-        # In a real implementation, this would stream responses from LLM
-        # For now, we'll simulate a response
+        # Make HTTP call to LLM
+        import httpx
+        import json
+        
         print(f"Executing slow path for: {text}")
-        return "I don't have a specific answer for that right now."
+        
+        # Construct the request to the LLM endpoint
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        # Get the conversation window for session
+        conversation = self._conversation_windows[session_id]
+        
+        # Create the message payload
+        payload = {
+            "model": self._config.llm_model,
+            "messages": [
+                {"role": "system", "content": conversation.system_prompt},
+                {"role": "user", "content": text}
+            ],
+            "stream": False
+        }
+        
+        try:
+            # Make the HTTP request to the LLM endpoint
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self._config.llm_base_url}/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=30.0
+                )
+                response.raise_for_status()
+                result = response.json()
+                return result["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"Error calling LLM: {e}")
+            return "I encountered an error processing your request."

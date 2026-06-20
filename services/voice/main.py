@@ -566,7 +566,7 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
         *wake_stages,
         vad,
         stt,
-        agent,
+        runtime,
         tts,
         wake_reset_relay,
         latency_observer,
