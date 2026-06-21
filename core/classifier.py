@@ -16,7 +16,7 @@ from typing import Literal
 
 from loguru import logger
 
-from shared.straylight_shared.events import IntentEvent
+from schemas.events import IntentEvent
 
 
 @dataclass(frozen=True)

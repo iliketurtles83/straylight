@@ -37,10 +37,10 @@ from pipecat.services.openai import OpenAILLMService
 from pipecat.services.piper.tts import PiperTTSService
 from pipecat.processors.audio.vad_processor import VADProcessor
 
-from services.agent.bus import publish
+from core.bus import publish
 from services.agent.agent_core import VoiceConfig, ConversationWindow, TranscriptTurn
-from services.agent.skills import SkillRegistry, SkillExecutionError
-from shared.straylight_shared.events import (
+from core.tools.registry import SkillRegistry, SkillExecutionError
+from schemas.events import (
     IntentEvent,
     StateEvent,
     SpeakingEvent,

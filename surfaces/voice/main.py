@@ -48,10 +48,10 @@ from pipecat.services.piper.tts import PiperTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
-from services.agent.runtime import CassRuntime, RuntimeConfig
+from core.runtime import CassRuntime, RuntimeConfig
 from .clients import OpenWakeWordDetector, VoiceDependencyError
 from .core import VoiceConfig
-from .skills.weather import WeatherSkill
+from core.tools.local.weather import WeatherSkill
 from .wake import WakeWordProcessor
 
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Callable, Awaitable, Dict, List
 
 from shared.straylight_shared.events import ToolCallEvent, ToolResultEvent
-from services.agent.observer import TurnObserver
+from core.observer import TurnObserver
 
 
 @dataclass(frozen=True)

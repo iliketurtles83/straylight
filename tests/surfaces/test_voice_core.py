@@ -9,11 +9,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
-from services.voice.agent import AgentProcessor
-from services.voice.core import ConversationWindow, VoiceConfig, audio_to_wav_bytes, load_system_prompt, normalize_reply_text
-from services.voice.clients import VoiceDependencyError
-from services.voice.skills import Skill
-from services.voice.skills.weather import WeatherSkill
+from core.runtime import AgentProcessor
+from surfaces.voice.core import ConversationWindow, VoiceConfig, audio_to_wav_bytes, load_system_prompt, normalize_reply_text
+from surfaces.voice.clients import VoiceDependencyError
+from surfaces.voice.skills import Skill
+from surfaces.voice.skills.weather import WeatherSkill
 
 
 class VoiceCoreTests(unittest.TestCase):
@@ -79,7 +79,7 @@ class VoiceCoreTests(unittest.TestCase):
         }
 
         with patch.dict(os.environ, env, clear=False):
-            from services.voice.core import VoiceConfig
+            from surfaces.voice.core import VoiceConfig
 
             config = VoiceConfig.from_env()
 
@@ -111,7 +111,7 @@ class WakeWordProcessorTests(unittest.TestCase):
         doesn't need to simulate real speech levels — tests focus on wake
         detection logic, not the energy gate itself.
         """
-        from services.voice.wake import WakeWordProcessor
+        from surfaces.voice.wake import WakeWordProcessor
 
         detector = MagicMock()
         detector.triggered.return_value = triggered_result
@@ -148,7 +148,7 @@ class WakeWordProcessorTests(unittest.TestCase):
 
         asyncio.run(run())
         # With triggered=False and sleeping state, no downstream frames should be emitted.
-        from services.voice.wake import WakeWordFrame
+        from surfaces.voice.wake import WakeWordFrame
         self.assertFalse(any(isinstance(f, WakeWordFrame) for f in received))
         self.assertFalse(any(isinstance(f, InputAudioRawFrame) for f in received))
 
@@ -180,7 +180,7 @@ class WakeWordProcessorTests(unittest.TestCase):
         """A triggered OWW detection should emit WakeWordFrame and switch to awake."""
         from pipecat.frames.frames import InputAudioRawFrame
         from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.wake import WakeWordFrame, _State
+        from surfaces.voice.wake import WakeWordFrame, _State
 
         proc, detector = self._make_processor(triggered_result=(0.85, True))
 
@@ -214,8 +214,8 @@ class WakeWordProcessorTests(unittest.TestCase):
 
     def test_startup_validation_fails_on_missing_model(self) -> None:
         """validate_startup() should raise VoiceDependencyError when wake models are absent."""
-        from services.voice.core import VoiceConfig
-        from services.voice.main import validate_startup
+        from surfaces.voice.core import VoiceConfig
+        from surfaces.voice.main import validate_startup
 
         with tempfile.TemporaryDirectory() as empty_dir:
             config = VoiceConfig(
@@ -228,7 +228,7 @@ class WakeWordProcessorTests(unittest.TestCase):
                 asyncio.run(validate_startup(config))
 
     def test_llama_server_validation_requires_tokenize_endpoint(self) -> None:
-        from services.voice.main import _validate_llama_server
+        from surfaces.voice.main import _validate_llama_server
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/health":
@@ -249,7 +249,7 @@ class WakeWordProcessorTests(unittest.TestCase):
             asyncio.run(run())
 
     def test_llama_server_validation_accepts_tokenize_tokens(self) -> None:
-        from services.voice.main import _validate_llama_server
+        from surfaces.voice.main import _validate_llama_server
 
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/health":
@@ -271,7 +271,7 @@ class WakeWordProcessorTests(unittest.TestCase):
         asyncio.run(run())
 
     def test_startup_validation_requires_ack_player_binary(self) -> None:
-        from services.voice.main import validate_startup
+        from surfaces.voice.main import validate_startup
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -295,8 +295,8 @@ class WakeWordProcessorTests(unittest.TestCase):
                 llm_base_url="http://llama.test",
             )
 
-            with patch("services.voice.main.shutil.which", return_value=None), patch(
-                "services.voice.main._validate_llama_server",
+            with patch("surfaces.voice.main.shutil.which", return_value=None), patch(
+                "surfaces.voice.main._validate_llama_server",
                 new=AsyncMock(return_value=None),
             ), patch("sounddevice.query_devices", return_value=[]), patch(
                 "sounddevice.check_input_settings", return_value=None
@@ -306,7 +306,7 @@ class WakeWordProcessorTests(unittest.TestCase):
 
     def test_to_mono_pcm16_uses_first_channel(self) -> None:
         from pipecat.frames.frames import InputAudioRawFrame
-        from services.voice.wake import WakeWordProcessor
+        from surfaces.voice.wake import WakeWordProcessor
 
         # Interleaved stereo: L=[1000, 2000], R=[-1000, -2000].
         frame = InputAudioRawFrame(
@@ -319,7 +319,7 @@ class WakeWordProcessorTests(unittest.TestCase):
         self.assertEqual(mono.tolist(), [1000, 2000])
 
     def test_resample_to_16k_from_48k(self) -> None:
-        from services.voice.wake import WakeWordProcessor
+        from surfaces.voice.wake import WakeWordProcessor
 
         # 48k input should downsample by ~3x when normalized to 16k.
         src = list(range(480))
@@ -332,7 +332,7 @@ class WakeWordProcessorTests(unittest.TestCase):
         """_flush_remaining must not go negative when a frame is larger than the flush window."""
         from pipecat.frames.frames import InputAudioRawFrame
         from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.wake import _State
+        from surfaces.voice.wake import _State
 
         proc, _detector = self._make_processor(triggered_result=(0.85, True))
 
@@ -370,7 +370,7 @@ class WakeWordProcessorTests(unittest.TestCase):
         import tempfile
         from pipecat.frames.frames import InputAudioRawFrame
         from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.wake import _State, WakeWordProcessor
+        from surfaces.voice.wake import _State, WakeWordProcessor
         from unittest.mock import MagicMock
 
         detector = MagicMock()
@@ -436,7 +436,7 @@ class WakeWordProcessorTests(unittest.TestCase):
     def test_wake_processor_applies_post_stop_drain(self) -> None:
         from pipecat.frames.frames import InputAudioRawFrame
         from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.wake import WakeWordProcessor
+        from surfaces.voice.wake import WakeWordProcessor
 
         detector = MagicMock()
         detector.triggered.return_value = (0.0, False)
@@ -476,7 +476,7 @@ class WakeResetRelayTests(unittest.TestCase):
         """WakeResetRelay should mirror TTSStoppedFrame upstream as BotStoppedSpeakingFrame."""
         from pipecat.frames.frames import BotStoppedSpeakingFrame, TTSStoppedFrame
         from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.main import WakeResetRelay
+        from surfaces.voice.main import WakeResetRelay
 
         relay = WakeResetRelay()
         seen: list[tuple[object, FrameDirection]] = []
@@ -499,7 +499,7 @@ class WakeResetRelayTests(unittest.TestCase):
     def test_wake_reset_relay_notifies_wake_on_tts_audio_and_stop(self) -> None:
         from pipecat.frames.frames import TTSStoppedFrame, TTSAudioRawFrame
         from pipecat.processors.frame_processor import FrameDirection
-        from services.voice.main import WakeResetRelay
+        from surfaces.voice.main import WakeResetRelay
 
         wake = MagicMock()
         relay = WakeResetRelay(wake_processor=wake)
@@ -616,7 +616,7 @@ class AgentDiagnosticsTests(unittest.TestCase):
     """End-to-end turn coverage: events + skill fallback."""
 
     def _make_agent(self, skill: Skill | None = None) -> tuple[AgentProcessor, list]:
-        from services.agent import publisher
+        from core import publisher
 
         captured: list = []
 
@@ -646,7 +646,7 @@ class AgentDiagnosticsTests(unittest.TestCase):
         return agent, captured
 
     def test_turn_publishes_diagnostics_event_on_slow_path(self) -> None:
-        from shared.straylight_shared.events import TurnDiagnosticsEvent, IntentEvent
+        from schemas.events import TurnDiagnosticsEvent, IntentEvent
 
         agent, captured = self._make_agent()
 
@@ -668,8 +668,8 @@ class AgentDiagnosticsTests(unittest.TestCase):
         self.assertEqual(intents[0].confidence, -1.0)
 
     def test_skill_failure_falls_back_to_spoken_message(self) -> None:
-        from services.voice.skills import SkillExecutionError
-        from shared.straylight_shared.events import TurnDiagnosticsEvent
+        from surfaces.voice.skills import SkillExecutionError
+        from schemas.events import TurnDiagnosticsEvent
 
         class BrokenSkill(Skill):
             @property
@@ -709,7 +709,7 @@ class AgentDiagnosticsTests(unittest.TestCase):
         self.assertEqual(diag[0].skill_label, "weather")
 
     def test_cancelled_turn_publishes_idle_cleanup(self) -> None:
-        from shared.straylight_shared.events import SpeakingEvent, StateEvent
+        from schemas.events import SpeakingEvent, StateEvent
 
         agent, captured = self._make_agent()
 

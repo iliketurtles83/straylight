@@ -11,13 +11,12 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List
 
-from services.agent.classifier import Classifier
-from services.agent.tools import ToolRegistry, ToolSpec, ToolResult
+from core.classifier import Classifier
+from core.tools.registry import ToolRegistry, ToolSpec, ToolResult
 from services.agent.agent_core import VoiceConfig, ConversationWindow
-from services.agent.skills.weather import WeatherSkill
-from services.agent.skills import Skill
-from services.agent.observer import TurnObserver
-from shared.straylight_shared.events import StateEvent, IntentEvent
+from core.tools.local.weather import WeatherSkill
+from core.observer import TurnObserver
+from schemas.events import StateEvent, IntentEvent
 
 
 @dataclass
@@ -248,7 +247,14 @@ async def _fast_path(self, text: str, tool_name: str, session_id: str) -> str:
 
     def _get_skill_for_tool(self, tool_name: str) -> Skill | None:
         """Get the skill associated with a tool name."""
-        # This is a simplified approach - in the future we might have a more 
+        # This is a simplified approach - in the future we might have a more
+        # sophisticated mapping between tools and skills
+        if tool_name == "weather":
+            return WeatherSkill()
+        return None
+    def _get_skill_for_tool(self, tool_name: str) -> Skill | None:
+        """Get the skill associated with a tool name."""
+        # This is a simplified approach - in the future we might have a more
         # sophisticated mapping between tools and skills
         if tool_name == "weather":
             return WeatherSkill()

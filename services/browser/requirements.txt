@@ -1,5 +1,0 @@
-# Browser UI service requirements
-fastapi
-uvicorn
-httpx
-loguru
