@@ -7,7 +7,7 @@ implementation for local testing and debugging.
 from __future__ import annotations
 
 from typing import Protocol
-from shared.straylight_shared.events import Event
+from schemas.events import Event
 
 
 class TurnObserver(Protocol):

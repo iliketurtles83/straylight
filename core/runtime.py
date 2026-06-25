@@ -9,11 +9,12 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List
 
 from core.classifier import Classifier
 from core.tools.registry import ToolRegistry, ToolSpec, ToolResult
-from services.agent.agent_core import VoiceConfig, ConversationWindow
+from core.agent_core import ConversationWindow
 from core.tools.local.weather import WeatherSkill
 from core.observer import TurnObserver
 from schemas.events import StateEvent, IntentEvent
@@ -177,7 +178,7 @@ class CassRuntime:
         """
         # Get or create conversation window for session
         if session_id not in self._conversation_windows:
-            from services.agent.agent_core import load_system_prompt
+            from core.agent_core import load_system_prompt
             system_prompt = load_system_prompt(Path(self._config.prompt_path))
             self._conversation_windows[session_id] = ConversationWindow(
                 system_prompt=system_prompt,
@@ -218,7 +219,7 @@ class CassRuntime:
         
         print(f"Processing turn for session {session_id}: {text}")
 
-async def _fast_path(self, text: str, tool_name: str, session_id: str) -> str:
+    async def _fast_path(self, text: str, tool_name: str, session_id: str) -> str:
         """Execute the fast path using a tool.
         
         Args:
@@ -245,13 +246,6 @@ async def _fast_path(self, text: str, tool_name: str, session_id: str) -> str:
             print(f"Fast path execution failed: {e}")
             raise
 
-    def _get_skill_for_tool(self, tool_name: str) -> Skill | None:
-        """Get the skill associated with a tool name."""
-        # This is a simplified approach - in the future we might have a more
-        # sophisticated mapping between tools and skills
-        if tool_name == "weather":
-            return WeatherSkill()
-        return None
     def _get_skill_for_tool(self, tool_name: str) -> Skill | None:
         """Get the skill associated with a tool name."""
         # This is a simplified approach - in the future we might have a more

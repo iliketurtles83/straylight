@@ -131,9 +131,7 @@ class WeatherSkill(Skill):
             return 0.75
         return 0.55
 
-    def can_handle(self, transcript: str) -> bool:
-        text = transcript.strip().lower()
-        return any(keyword in text for keyword in _WEATHER_KEYWORDS)
+ 
 
     def entities(self, transcript: str) -> dict[str, Any]:
         location = _extract_location_regex(transcript)

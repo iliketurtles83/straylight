@@ -10,7 +10,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Callable, Awaitable, Dict, List
 
-from shared.straylight_shared.events import ToolCallEvent, ToolResultEvent
+from schemas.events import ToolCallEvent, ToolResultEvent
 from core.observer import TurnObserver
 
 

@@ -525,8 +525,7 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
         history_tokens=config.history_tokens,
         llm_ctx_size=config.llm_ctx_size,
         llm_output_size=config.llm_output_size,
-        redis_url=config.redis_url,
-        mcp_server_urls=config.mcp_server_urls,
+        prompt_path=config.prompt_path,
     )
     
     # Create CassRuntime instance
