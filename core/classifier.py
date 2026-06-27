@@ -12,7 +12,7 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 from loguru import logger
 
@@ -25,6 +25,7 @@ class ClassifierResult:
     confidence: float
     source: Literal["embedding", "disabled"]
     latency_ms: int
+    classifier_ms: int
 
 
 class Classifier:
@@ -80,7 +81,8 @@ class Classifier:
                 tool_name=None,
                 confidence=-1.0,
                 source="disabled",
-                latency_ms=int((time.monotonic() - start_time) * 1000)
+                latency_ms=int((time.monotonic() - start_time) * 1000),
+                classifier_ms=int((time.monotonic() - start_time) * 1000)
             )
         
         try:
@@ -110,7 +112,8 @@ class Classifier:
                     tool_name=best_match,
                     confidence=best_score,
                     source="embedding",
-                    latency_ms=latency_ms
+                    latency_ms=latency_ms,
+                    classifier_ms=latency_ms
                 )
             
             # Otherwise, route to slow path
@@ -119,7 +122,8 @@ class Classifier:
                 tool_name=None,
                 confidence=best_score,
                 source="embedding",
-                latency_ms=latency_ms
+                latency_ms=latency_ms,
+                classifier_ms=latency_ms
             )
             
         except Exception as e:
@@ -130,14 +134,18 @@ class Classifier:
                 tool_name=None,
                 confidence=-1.0,
                 source="disabled",
-                latency_ms=latency_ms
+                latency_ms=latency_ms,
+                classifier_ms=latency_ms
             )
     
     def _embed_sync(self, text: str) -> list[float]:
         """Embed a single text synchronously. Runs in a thread."""
         if self._embed_model is None:
             raise RuntimeError("Embed model not loaded")
-        return self._embed_model.create_embedding(text)["data"][0]["embedding"]
+        embedding = self._embed_model.create_embedding(text)["data"][0]["embedding"]
+        if isinstance(embedding[0], list):
+            return embedding[0]
+        return embedding
     
     def _cosine_similarity(self, a: list[float], b: list[float]) -> float:
         """Calculate cosine similarity between two vectors."""

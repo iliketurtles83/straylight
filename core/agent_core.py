@@ -8,7 +8,7 @@ import os
 import re
 import wave
 
-_BASE_DIR = Path(__file__).resolve().parents[2]
+_BASE_DIR = Path(__file__).resolve().parents[1]
 
 
 DEFAULT_SAMPLE_RATE = 16000
@@ -32,37 +32,19 @@ class VoiceConfig:
     stt_model: str = "base.en"
     stt_device: str = "cpu"
     stt_compute_type: str = "int8"
-    llm_base_url: str = "http://127.0.0.1:8080"
-    llm_model: str = "cass"
     tts_model_path: Path = _BASE_DIR / "models" / "tts" / "en_US-amy-medium.onnx"
     ack_sound_path: Path = _BASE_DIR / "models" / "tts" / "ack.mp3"
     ack_player_bin: str = "ffplay"
     bot_audio_drain_ms: int = 450
     input_device_name: str | None = None
     output_device_name: str | None = None
-    history_tokens: int = DEFAULT_HISTORY_TOKENS
-    embed_model_path: Path = _BASE_DIR / "models" / "embed" / "nomic-embed-text-v1.5.f16.gguf"
-    router_exemplars_path: Path = _BASE_DIR / "exemplars.jsonl"
-    router_threshold: float = 0.80
-    router_min_gap: float = 0.05
     listen_mode: bool = False  # skip wake word; pipeline always active
-    llm_ctx_size: int = 32768  # context window size for LLM
-    llm_output_size: int = 1024  # maximum output tokens for LLM
 
     @classmethod
     def from_env(cls) -> "VoiceConfig":
-        prompt_path = Path(os.getenv("CASS_PROMPT_PATH", str(_BASE_DIR / "services" / "voice" / "cass_prompt.txt")))
+        prompt_path = Path(os.getenv("CASS_PROMPT_PATH", str(_BASE_DIR / "core" / "cass_prompt.txt")))
         wake_model_dir = Path(os.getenv("CASS_WAKE_MODEL_DIR", str(_BASE_DIR / "models" / "wake")))
         tts_model_path = Path(os.getenv("TTS_PIPER_MODEL", str(_BASE_DIR / "models" / "tts" / "en_US-amy-medium.onnx")))
-        embed_model_path = Path(
-            os.getenv(
-                "CASS_EMBED_MODEL_PATH",
-                str(_BASE_DIR / "models" / "embed" / "nomic-embed-text-v1.5.f16.gguf"),
-            )
-        )
-        router_exemplars_path = Path(
-            os.getenv("CASS_EXEMPLARS_PATH", str(_BASE_DIR / "exemplars.jsonl"))
-        )
         ack_raw = os.getenv("CASS_ACK_SOUND_PATH", "").strip()
         ack_sound_path = Path(ack_raw) if ack_raw else _BASE_DIR / "models" / "tts" / "ack.mp3"
 
@@ -80,22 +62,13 @@ class VoiceConfig:
             stt_model=os.getenv("WHISPER_MODEL", "base.en").strip() or "base.en",
             stt_device=os.getenv("WHISPER_DEVICE", "cpu").strip() or "cpu",
             stt_compute_type=os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip() or "int8",
-            llm_base_url=os.getenv("CASS_LLM_BASE_URL", "http://127.0.0.1:8080").strip() or "http://127.0.0.1:8080",
-            llm_model=os.getenv("CASS_LLM_MODEL", "cass").strip() or "cass",
             tts_model_path=tts_model_path,
             ack_sound_path=ack_sound_path,
             ack_player_bin=os.getenv("CASS_ACK_PLAYER_BIN", "ffplay").strip() or "ffplay",
             bot_audio_drain_ms=_env_int("CASS_BOT_AUDIO_DRAIN_MS", 450),
             input_device_name=_env_optional_str("CASS_INPUT_DEVICE_NAME"),
             output_device_name=_env_optional_str("CASS_OUTPUT_DEVICE_NAME"),
-            history_tokens=_env_int("CASS_HISTORY_TOKENS", DEFAULT_HISTORY_TOKENS),
-            embed_model_path=embed_model_path,
-            router_exemplars_path=router_exemplars_path,
-            router_threshold=_env_float("CASS_ROUTER_THRESHOLD", 0.80),
-            router_min_gap=_env_float("CASS_ROUTER_MIN_GAP", 0.05),
             listen_mode=os.getenv("CASS_LISTEN_MODE", "").strip().lower() in ("1", "true", "yes"),
-            llm_ctx_size=_env_int("CASS_LLM_CTX_SIZE", 32768),
-            llm_output_size=_env_int("CASS_LLM_OUTPUT_SIZE", 1024),
         )
 
 

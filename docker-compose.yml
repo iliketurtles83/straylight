@@ -21,7 +21,7 @@ services:
     volumes:
       - ./models:/app/models:ro
       - ./shared:/app/shared:ro
-      - ./services/voice/cass_prompt.txt:/app/cass_prompt.txt:ro
+      - ./core/cass_prompt.txt:/app/cass_prompt.txt:ro
       - ./scripts:/app/scripts:ro
       - ./exemplars.jsonl:/app/exemplars.jsonl:ro
     devices:

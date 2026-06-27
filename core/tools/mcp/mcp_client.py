@@ -6,14 +6,12 @@ external MCP servers.
 
 from __future__ import annotations
 
-import asyncio
-import json
-from typing import List, Dict, Any
+from typing import List
 
 import httpx
 from loguru import logger
 
-from services.agent.tools import ToolSpec
+from core.tools.registry import ToolSpec
 
 
 class MCPClient:

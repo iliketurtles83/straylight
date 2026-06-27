@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List
@@ -25,7 +26,7 @@ class RuntimeConfig:
     """Configuration for the CassRuntime."""
     llm_base_url: str
     llm_model: str
-    embed_model_path: str
+    embed_model_path: Path
     router_exemplars_path: str
     router_threshold: float
     router_min_gap: float
@@ -33,6 +34,24 @@ class RuntimeConfig:
     llm_ctx_size: int
     llm_output_size: int
     prompt_path: str
+    
+    @classmethod
+    def from_env(cls) -> 'RuntimeConfig':
+        """Create a RuntimeConfig instance from environment variables."""
+        from core.agent_core import _env_int, _env_float, _env_optional_str
+        
+        return cls(
+            llm_base_url=os.getenv("CASS_LLM_BASE_URL", "http://localhost:11434"),
+            llm_model=os.getenv("CASS_LLM_MODEL", "llama3"),
+            embed_model_path=Path(os.getenv("CASS_EMBED_MODEL_PATH", "models/embedding_model.gguf")),
+            router_exemplars_path=os.getenv("CASS_EXEMPLARS_PATH", "data/exemplars.jsonl"),
+            router_threshold=float(os.getenv("CASS_ROUTER_THRESHOLD", "0.7")),
+            router_min_gap=float(os.getenv("CASS_ROUTER_MIN_GAP", "0.1")),
+            history_tokens=_env_int("CASS_HISTORY_TOKENS", 2048),
+            llm_ctx_size=_env_int("CASS_LLM_CTX_SIZE", 2048),
+            llm_output_size=_env_int("CASS_LLM_OUTPUT_SIZE", 1024),
+            prompt_path=Path(__file__).resolve().parent / 'cass_prompt.txt'
+        )
 
 
 class CassRuntime:
@@ -153,11 +172,9 @@ class CassRuntime:
     async def shutdown(self) -> None:
         """Shut down the runtime components."""
         self._shutdown = True
-        if self._event_bus:
-            await self._event_bus.shutdown()
         print("CassRuntime shut down")
 
-    async def handle_input(self, text: str, session_id: str) -> None:
+    async def handle_input(self, text: str, session_id: str) -> str:
         """Handle input from the gateway.
         
         This is called when cass:input fires. It owns the full turn:
@@ -167,9 +184,9 @@ class CassRuntime:
             text: The input text
             session_id: The session identifier
         """
-        await self._run_turn(text, session_id)
+        return await self._run_turn(text, session_id)
 
-    async def _run_turn(self, text: str, session_id: str) -> None:
+    async def _run_turn(self, text: str, session_id: str) -> str:
         """Execute a single turn of conversation.
         
         Args:
@@ -192,7 +209,7 @@ class CassRuntime:
         
         # Emit IntentEvent for the classification result
         if self._observer:
-            await self._observer.notify(IntentEvent(
+            self._observer.notify(IntentEvent(
                 path="fast" if classifier_result.tool_name else "slow",
                 skill_label=classifier_result.tool_name,
                 confidence=classifier_result.confidence,
@@ -218,6 +235,8 @@ class CassRuntime:
         conversation.add_turn(text, result)
         
         print(f"Processing turn for session {session_id}: {text}")
+        
+        return result
 
     async def _fast_path(self, text: str, tool_name: str, session_id: str) -> str:
         """Execute the fast path using a tool.

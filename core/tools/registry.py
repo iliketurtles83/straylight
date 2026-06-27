@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Callable, Awaitable, Dict, List
+import time
+from typing import Callable, Awaitable, Dict
 
 from schemas.events import ToolCallEvent, ToolResultEvent
 from core.observer import TurnObserver
@@ -89,7 +90,7 @@ class ToolRegistry:
                 timestamp_ms=int(asyncio.get_event_loop().time() * 1000),
             )
             if self._observer:
-                await self._observer.notify(tool_call_event)
+                self._observer.notify(tool_call_event)
             
             # Execute the tool
             start_time = asyncio.get_event_loop().time()
