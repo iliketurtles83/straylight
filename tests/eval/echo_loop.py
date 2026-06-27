@@ -50,9 +50,9 @@ from pipecat.services.piper.tts import PiperTTSService
 from pipecat.services.whisper.stt import WhisperSTTService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 
-from services.voice.clients import OpenWakeWordDetector
-from services.voice.core import VoiceConfig
-from services.voice.wake import WakeWordProcessor
+from surfaces.voice.clients import OpenWakeWordDetector
+from surfaces.voice.config import VoiceConfig
+from surfaces.voice.wake import WakeWordProcessor
 
 
 # ---------------------------------------------------------------------------

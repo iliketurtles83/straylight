@@ -73,6 +73,3 @@ ENV HOME=/home/app
 
 # Expose the port that llama-server will use (if needed)
 EXPOSE 8080
-
-# Command to run the application
-CMD ["bash", "scripts/dev_gemma.sh"]

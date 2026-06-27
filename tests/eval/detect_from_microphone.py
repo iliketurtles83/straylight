@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    from services.voice.clients import OpenWakeWordDetector, VoiceDependencyError
+    from surfaces.voice.clients import OpenWakeWordDetector, VoiceDependencyError
 
     args = parse_args()
 
