@@ -44,14 +44,21 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.services.piper.tts import PiperTTSService
+try:
+    from pipecat.services.piper.tts import PiperTTSService
+except ImportError:
+    PiperTTSService = None  # type: ignore
 from pipecat.services.whisper.stt import WhisperSTTService
-from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+try:
+    from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+except ImportError:
+    LocalAudioTransport = None  # type: ignore
+    LocalAudioTransportParams = None  # type: ignore
 
 from core.runtime import CassRuntime, RuntimeConfig
+from .agent import AgentProcessor
 from .clients import OpenWakeWordDetector, VoiceDependencyError
-from .core import VoiceConfig
-from core.tools.local.weather import WeatherSkill
+from surfaces.voice.config import VoiceConfig
 from .wake import WakeWordProcessor
 
 
@@ -472,15 +479,18 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
         preferred_input_name=config.input_device_name,
         preferred_output_name=config.output_device_name,
     )
-    transport = LocalAudioTransport(
-        LocalAudioTransportParams(
-            audio_in_enabled=True,
-            audio_in_sample_rate=config.sample_rate,
-            audio_out_enabled=True,
-            input_device_index=input_device_index,
-            output_device_index=output_device_index,
+    if LocalAudioTransport is not None:
+        transport = LocalAudioTransport(
+            LocalAudioTransportParams(
+                audio_in_enabled=True,
+                audio_in_sample_rate=config.sample_rate,
+                audio_out_enabled=True,
+                input_device_index=input_device_index,
+                output_device_index=output_device_index,
+            )
         )
-    )
+    else:
+        raise VoiceDependencyError("LocalAudioTransport requires pyaudio")
 
     # --- Wake word (skipped in listen mode) ----------------------------------
     if not config.listen_mode:
@@ -514,28 +524,20 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
     )
 
     # --- CassRuntime ---------------------------------------------------------
-    # Create runtime config
-    runtime_config = RuntimeConfig(
-        llm_base_url=config.llm_base_url,
-        llm_model=config.llm_model,
-        embed_model_path=config.embed_model_path,
-        router_exemplars_path=config.router_exemplars_path,
-        router_threshold=config.router_threshold,
-        router_min_gap=config.router_min_gap,
-        history_tokens=config.history_tokens,
-        llm_ctx_size=config.llm_ctx_size,
-        llm_output_size=config.llm_output_size,
-        prompt_path=config.prompt_path,
-    )
+    # Create runtime config from environment variables
+    runtime_config = RuntimeConfig.from_env()
     
     # Create CassRuntime instance
     runtime = CassRuntime(runtime_config)
 
     # --- TTS -----------------------------------------------------------------
-    tts = PiperTTSService(
-        settings=PiperTTSService.Settings(voice=config.tts_model_path.stem),
-        download_dir=config.tts_model_path.parent,
-    )
+    if PiperTTSService is not None:
+        tts = PiperTTSService(
+            settings=PiperTTSService.Settings(voice=config.tts_model_path.stem),
+            download_dir=config.tts_model_path.parent,
+        )
+    else:
+        tts = None  # type: ignore
 
     # --- VAD (gates Whisper turn segmentation) --------------------------------
     # Segmented WhisperSTTService only emits TranscriptionFrame after receiving
@@ -565,8 +567,8 @@ def build_pipeline(config: VoiceConfig) -> tuple[Pipeline, WakeWordProcessor | N
         *wake_stages,
         vad,
         stt,
-        runtime,
-        tts,
+        AgentProcessor(runtime),
+        *(tts if tts is not None else []),
         wake_reset_relay,
         latency_observer,
         transport.output(),

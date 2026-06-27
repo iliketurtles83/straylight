@@ -7,30 +7,18 @@ turn management.
 
 from __future__ import annotations
 
-import asyncio
-import time
-from typing import Any, Literal, Optional, Tuple
+from typing import Optional
 
 from loguru import logger
 
 from pipecat.frames.frames import (
     Frame,
-    FrameDirection,
+    TextFrame,
     TranscriptionFrame,
 )
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from core.runtime import CassRuntime
-from core.observer import TurnObserver
-from schemas.events import (
-    IntentEvent,
-    StateEvent,
-    SpeakingEvent,
-    ToolCallEvent,
-    ToolResultEvent,
-    TurnDiagnosticsEvent,
-    TranscriptEvent,
-)
 
 
 class AgentProcessor(FrameProcessor):
@@ -49,7 +37,8 @@ class AgentProcessor(FrameProcessor):
         text = frame.text
         
         # Delegate to CassRuntime's single entrypoint
-        await self._runtime.handle_input(text, frame.session_id)
+        response = await self._runtime.handle_input(text, frame.session_id)
+        await self.push_frame(TextFrame(text=response), direction)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         """Process frames from the pipeline."""

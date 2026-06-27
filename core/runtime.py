@@ -88,9 +88,14 @@ class CassRuntime:
         self._tool_registry = ToolRegistry(observer=self._observer)
         
         # Register the weather tool (real implementation)
-        weather_skill = WeatherSkill()
-        weather_tool_spec = self._create_weather_tool_spec(weather_skill)
+        self._weather_skill = WeatherSkill()
+        weather_tool_spec = self._create_weather_tool_spec(self._weather_skill)
         self._tool_registry.register(weather_tool_spec)
+        
+        # Register skill exemplars with the classifier for embedding-based classification
+        if self._weather_skill.exemplars:
+            self._classifier.register_exemplars("weather", self._weather_skill.exemplars)
+            print(f"Registered {len(self._weather_skill.exemplars)} weather skill exemplars")
         
         # 3. Emit StateEvent(idle)
         if self._observer:
@@ -128,7 +133,8 @@ class CassRuntime:
                 },
                 "required": ["text"]
             },
-            execute=execute_weather_tool
+            execute=execute_weather_tool,
+            skill=skill
         )
 
     async def _load_exemplars(self) -> None:
@@ -265,12 +271,11 @@ class CassRuntime:
             print(f"Fast path execution failed: {e}")
             raise
 
-    def _get_skill_for_tool(self, tool_name: str) -> Skill | None:
+    def _get_skill_for_tool(self, tool_name: str) -> Any | None:
         """Get the skill associated with a tool name."""
-        # This is a simplified approach - in the future we might have a more
-        # sophisticated mapping between tools and skills
-        if tool_name == "weather":
-            return WeatherSkill()
+        tool = self._tool_registry.get_tool(tool_name)
+        if tool and tool.skill:
+            return tool.skill
         return None
 
     async def _slow_path(self, text: str, session_id: str) -> str:

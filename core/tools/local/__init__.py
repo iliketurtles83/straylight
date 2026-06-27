@@ -23,11 +23,6 @@ class Skill(ABC):
         return ""
 
     @abstractmethod
-    def score(self, transcript: str) -> float:
-        """Score how well this skill matches a transcript."""
-        pass
-
-    @abstractmethod
     def entities(self, transcript: str) -> dict[str, Any]:
         """Extract entities from the transcript."""
         pass

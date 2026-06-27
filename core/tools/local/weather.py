@@ -51,20 +51,6 @@ _LOCATION_TRAILING_RE = re.compile(
     r"\s+(?:today|tonight|tomorrow|right\s+now|now|currently|this\s+\w+)\s*$",
     re.IGNORECASE,
 )
-_WEATHER_KEYWORDS = (
-    "weather",
-    "forecast",
-    "temperature",
-    "humidity",
-    "wind",
-    "rain",
-    "snow",
-    "sunny",
-    "storm",
-    "umbrella",
-)
-
-
 def _wmo_condition(code: int) -> str:
     return _WMO_CODES.get(code, f"Unknown condition ({code})")
 
@@ -114,24 +100,6 @@ class WeatherSkill(Skill):
             "condition, and temperature. Include wind or humidity only if notable."
         )
 
-    def score(self, transcript: str) -> float:
-        text = transcript.strip().lower()
-        words = set(text.split())
-        if not words:
-            return 0.0
-        hit = sum(1 for kw in _WEATHER_KEYWORDS if kw in text)
-        if hit == 0:
-            return 0.0
-        # Scale: 1 hit → 0.55, 2 hits → 0.75, 3+ → 0.95.
-        # Caps at 0.95 so a weak keyword hit never overrides a strong
-        # embedding match for a *different* skill.
-        if hit >= 3:
-            return 0.95
-        if hit >= 2:
-            return 0.75
-        return 0.55
-
- 
 
     def entities(self, transcript: str) -> dict[str, Any]:
         location = _extract_location_regex(transcript)

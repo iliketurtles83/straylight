@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import time
-from typing import Callable, Awaitable, Dict
+from typing import Any, Callable, Awaitable, Dict
 
 from schemas.events import ToolCallEvent, ToolResultEvent
 from core.observer import TurnObserver
@@ -29,6 +29,7 @@ class ToolSpec:
     description: str
     input_schema: dict
     execute: Callable[[dict], Awaitable[ToolResult]]
+    skill: Any = None
 
 
 class ToolNotFoundError(Exception):
@@ -124,6 +125,17 @@ class ToolRegistry:
         except Exception as e:
             # Wrap any tool execution errors
             raise ToolExecutionError(f"Tool {tool_name} execution failed: {str(e)}") from e
+    
+    def get_tool(self, tool_name: str) -> ToolSpec | None:
+        """Get a tool spec by name.
+        
+        Args:
+            tool_name: Name of the tool
+            
+        Returns:
+            ToolSpec if found, None otherwise
+        """
+        return self._tools.get(tool_name)
     
     def manifest(self) -> list[dict]:
         """Return OpenAI-style tool manifest for the LLM.
